@@ -272,8 +272,12 @@ public abstract class PointValues {
     /** Visit all the docs below the current node. */
     void visitDocIDs(IntersectVisitor visitor) throws IOException;
 
+    //void prefetchDocIDs(IntersectVisitor visitor) throws IOException;
+
     /** Visit all the docs and values below the current node. */
     void visitDocValues(IntersectVisitor visitor) throws IOException;
+
+    default void  prefetchDocValues(IntersectVisitor visitor) throws IOException {};
   }
 
   /**
@@ -495,3 +499,4 @@ public abstract class PointValues {
   /** Returns the total number of documents that have indexed at least one point. */
   public abstract int getDocCount();
 }
+

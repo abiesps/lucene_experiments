@@ -18,6 +18,9 @@ package org.apache.lucene.util.bkd;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.PointValues;
@@ -194,7 +197,7 @@ public class BKDReader extends PointValues {
         isTreeBalanced);
   }
 
-  private static class BKDPointTree implements PointTree {
+  public static class BKDPointTree implements PointTree {
     private int nodeID;
     // during clone, the node root can be different to 1
     private final int nodeRoot;
@@ -246,7 +249,7 @@ public class BKDReader extends PointValues {
     // if true the tree is balanced, otherwise unbalanced
     private final boolean isTreeBalanced;
 
-    private BKDPointTree(
+    public BKDPointTree(
         IndexInput innerNodes,
         IndexInput leafNodes,
         BKDConfig config,
@@ -278,7 +281,11 @@ public class BKDReader extends PointValues {
       readNodeData(false);
     }
 
-    private BKDPointTree(
+    public long innerNodesSize() {
+      return innerNodes.length();
+    }
+
+    public BKDPointTree(
         IndexInput innerNodes,
         IndexInput leafNodes,
         BKDConfig config,
@@ -331,6 +338,179 @@ public class BKDReader extends PointValues {
       this.scratchMaxIndexPackedValue = scratchMaxIndexPackedValue;
       this.docIdsWriter = scratchIterator.docIdsWriter;
     }
+
+    public void prefetch(long fp, int len) {
+        try {
+          leafNodes.prefetch(fp, 1);
+        } catch (IOException e) {
+          e.printStackTrace();
+            //throw new RuntimeException(e);
+        }
+    }
+
+    /** Dump the current in-memory state of this BKDPointTree instance. */
+    public String logState() {
+
+
+
+      final StringBuilder sb = new StringBuilder(4_096);
+      sb.append("BKDPointTree State\n");
+      sb.append("  nodeID=").append(nodeID)
+              .append(" nodeRoot=").append(nodeRoot)
+              .append(" level=").append(level)
+              .append(" leafNodeOffset=").append(leafNodeOffset)
+              .append(" isLeaf=").append(isLeafNode())
+              .append(" isLeft=").append(isLeftNode())
+              .append(" isRoot=").append(isRootNode())
+              .append('\n');
+
+      sb.append("  version=").append(version)
+              .append(" isTreeBalanced=").append(isTreeBalanced)
+              .append(" pointCount=").append(pointCount)
+              .append(" lastLeafNodePointCount=").append(lastLeafNodePointCount)
+              .append(" rightMostLeafNode=").append(rightMostLeafNode)
+              .append('\n');
+
+      // Config summary
+      sb.append("  config{")
+              .append("numDims=").append(config.numDims())
+              .append(", numIndexDims=").append(config.numIndexDims())
+              .append(", bytesPerDim=").append(config.bytesPerDim())
+              .append(", maxPointsInLeaf=").append(config.maxPointsInLeafNode())
+              .append(", packedIndexBytesLength=").append(config.packedIndexBytesLength())
+              .append(", packedBytesLength=").append(config.packedBytesLength())
+              .append("}\n");
+
+      // Arrays that track traversal state
+      sb.append("  leafBlockFPStack=").append(java.util.Arrays.toString(leafBlockFPStack)).append('\n');
+      sb.append("  readNodeDataPositions=").append(java.util.Arrays.toString(readNodeDataPositions)).append('\n');
+      sb.append("  rightNodePositions=").append(java.util.Arrays.toString(rightNodePositions)).append('\n');
+      sb.append("  splitDimsPos=").append(java.util.Arrays.toString(splitDimsPos)).append('\n');
+
+      sb.append("Total docs visited as per traversal").append(totalDocsVisited).append('\n');
+      sb.append("leaf node name").append(leafNodes.resourceDescription).append('\n');
+      sb.append("leaf blocks").append(leafBlocks()).append('\n');
+
+      // negativeDeltas is packed [level * numIndexDims + dim]
+//      final int treeDepth = splitDimsPos.length;
+//      final int nIdxDims = config.numIndexDims();
+//      sb.append("  negativeDeltas per level×dim:\n");
+//      for (int lvl = 0; lvl < treeDepth; lvl++) {
+//        sb.append("    level ").append(lvl).append(": [");
+//        for (int dim = 0; dim < nIdxDims; dim++) {
+//          if (dim > 0) sb.append(", ");
+//          int idx = lvl * nIdxDims + dim;
+//          if (idx >= negativeDeltas.length) {
+//            sb.append("NA");
+//          } else {
+//            sb.append(negativeDeltas[idx] ? 'T' : 'F');
+//          }
+//        }
+//        sb.append("]\n");
+//      }
+//
+//      // Current bounds (grouped per dimension)
+//      sb.append("  minPackedValue=").append(bytesPerDimToHex(minPackedValue, config.bytesPerDim(), config.numIndexDims())).append('\n');
+//      sb.append("  maxPackedValue=").append(bytesPerDimToHex(maxPackedValue, config.bytesPerDim(), config.numIndexDims())).append('\n');
+//
+//      // splitValuesStack per level (only if allocated)
+//      sb.append("  splitValuesStack per level (hex per-dim):\n");
+//      for (int lvl = 0; lvl < splitValuesStack.length; lvl++) {
+//        if (splitValuesStack[lvl] != null) {
+//          sb.append("    L").append(lvl).append(": ")
+//                  .append(bytesPerDimToHex(splitValuesStack[lvl], config.bytesPerDim(), config.numIndexDims()))
+//                  .append('\n');
+//        } else {
+//          sb.append("    L").append(lvl).append(": null\n");
+//        }
+//      }
+//
+//      // splitDimValueStack per level (only if allocated)
+//      sb.append("  splitDimValueStack per level (one dim snapshot):\n");
+//      for (int lvl = 0; lvl < splitDimValueStack.length; lvl++) {
+//        if (splitDimValueStack[lvl] != null) {
+//          sb.append("    L").append(lvl).append(": ")
+//                  .append(bytesToHex(splitDimValueStack[lvl]))
+//                  .append('\n');
+//        } else {
+//          sb.append("    L").append(lvl).append(": null\n");
+//        }
+//      }
+//
+//      // Iterator scratch info
+//      if (scratchIterator != null) {
+//        sb.append("  scratchIterator{")
+//                .append("offset=").append(getField(scratchIterator, "offset"))
+//                .append(", length=").append(getField(scratchIterator, "length"))
+//                .append(", idx=").append(getField(scratchIterator, "idx"))
+//                .append(", docID=").append(getField(scratchIterator, "docID"))
+//                .append("}\n");
+//        // Show a small prefix of docIDs for context (doesn't mutate)
+//        final int[] ids = scratchIterator.docIDs;
+//        final int show = Math.min(ids.length, 16);
+//        sb.append("  scratchIterator.docIDs[0..").append(show - 1).append("]=")
+//                .append(java.util.Arrays.toString(java.util.Arrays.copyOf(ids, show))).append('\n');
+//      }
+//
+//      // I/O positions (best-effort; guard for IOException)
+//      try {
+//        sb.append("  innerNodes.fp=").append(innerNodes.getFilePointer())
+//                .append(" leafNodes.fp=").append(leafNodes.getFilePointer())
+//                .append('\n');
+//      } catch (Exception ioe) {
+//        sb.append("  [failed to read file pointers: ").append(ioe).append("]\n");
+//      }
+
+      return sb.toString();
+    }
+
+    /** Hex dump of bytes grouped by dimensions (e.g., [d0: 01 02 ... | d1: ...]). */
+    private static String bytesPerDimToHex(byte[] a, int bytesPerDim, int numDims) {
+      if (a == null) return "null";
+      StringBuilder sb = new StringBuilder(2 + a.length * 2 + numDims * 6);
+      sb.append('[');
+      for (int d = 0; d < numDims; d++) {
+        if (d > 0) sb.append(" | ");
+        sb.append("d").append(d).append(": ");
+        int start = d * bytesPerDim;
+        int end = Math.min(start + bytesPerDim, a.length);
+        for (int i = start; i < end; i++) {
+          int v = a[i] & 0xFF;
+          if (i > start) sb.append(' ');
+          sb.append(Character.forDigit((v >>> 4) & 0xF, 16));
+          sb.append(Character.forDigit(v & 0xF, 16));
+        }
+      }
+      sb.append(']');
+      return sb.toString();
+    }
+
+    /** Simple hex dump for a whole byte[] (no grouping). */
+    private static String bytesToHex(byte[] a) {
+      if (a == null) return "null";
+      StringBuilder sb = new StringBuilder(a.length * 2);
+      for (byte b : a) {
+        int v = b & 0xFF;
+        sb.append(Character.forDigit((v >>> 4) & 0xF, 16));
+        sb.append(Character.forDigit(v & 0xF, 16));
+      }
+      return sb.toString();
+    }
+
+    /**
+     * Best-effort reflectively read private fields from BKDReaderDocIDSetIterator
+     * without breaking encapsulation or modifying state.
+     */
+    private static Object getField(Object o, String name) {
+      try {
+        java.lang.reflect.Field f = o.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        return f.get(o);
+      } catch (Throwable t) {
+        return "(n/a)";
+      }
+    }
+
 
     @Override
     public PointTree clone() {
@@ -390,7 +570,7 @@ public class BKDReader extends PointValues {
       return true;
     }
 
-    private void resetNodeDataPosition() throws IOException {
+    public void resetNodeDataPosition() throws IOException {
       // move position of the inner nodes index to visit the first child
       assert readNodeDataPositions[level] <= innerNodes.getFilePointer();
       innerNodes.seek(readNodeDataPositions[level]);
@@ -610,16 +790,99 @@ public class BKDReader extends PointValues {
     }
 
     @Override
+    public void prefetchDocValues(PointValues.IntersectVisitor visitor) throws IOException {
+      resetNodeDataPosition();
+      prefetchLeavesOneByOne(visitor);
+    }
+
+    private void prefetchLeavesOneByOne(PointValues.IntersectVisitor visitor) throws IOException {
+      if (isLeafNode()) {
+        // Leaf node
+        prefetchDocValues(visitor, getLeafBlockFP());
+      } else {
+        pushLeft();
+        prefetchLeavesOneByOne(visitor);
+        pop();
+        pushRight();
+        prefetchLeavesOneByOne(visitor);
+        pop();
+      }
+    }
+
+
+    private void prefetchDocValues(PointValues.IntersectVisitor visitor, long fp) throws IOException {
+      // Leaf node; scan and filter all points in this block:
+      // leaf ordinals are 0..numLeaves-1
+//      ToDo add prefetch leaf block code here
+      prefetchLeafBlock(leafNodes, fp);
+      //int count = readDocIDs(leafNodes, fp, scratchIterator);
+//      if (version >= BKDWriter.VERSION_LOW_CARDINALITY_LEAVES) {
+//        visitDocValuesWithCardinality(
+//                commonPrefixLengths,
+//                scratchDataPackedValue,
+//                scratchMinIndexPackedValue,
+//                scratchMaxIndexPackedValue,
+//                leafNodes,
+//                scratchIterator,
+//                count,
+//                visitor);
+//      } else {
+//        visitDocValuesNoCardinality(
+//                commonPrefixLengths,
+//                scratchDataPackedValue,
+//                scratchMinIndexPackedValue,
+//                scratchMaxIndexPackedValue,
+//                leafNodes,
+//                scratchIterator,
+//                count,
+//                visitor);
+//      }
+    }
+
+
+
+
+    @Override
     public void visitDocValues(PointValues.IntersectVisitor visitor) throws IOException {
       resetNodeDataPosition();
       visitLeavesOneByOne(visitor);
     }
 
+    public Set<Long> leafBlockFPs = new HashSet<>();
+
+
+    public String name() {
+      return innerNodes.resourceDescription + "_" + leafNodes.resourceDescription;
+    }
+    public void markLeafForVisiting() {
+      if (isLeafNode()) {
+        // Leaf node
+
+        long leafBlockFP = getLeafBlockFP();
+          try {
+              leafNodes.prefetch(leafBlockFP, 1);
+          } catch (IOException e) {
+            e.printStackTrace();
+
+          }
+          leafBlockFPs.add(leafBlockFP);
+        //System.out.println("");
+        //visitDocValues(visitor, leafBlockFP);
+      } else {
+        System.out.println("===========IF we are here - we are fucked ============================================");
+      }
+    }
+
+
     private void visitLeavesOneByOne(PointValues.IntersectVisitor visitor) throws IOException {
       if (isLeafNode()) {
         // Leaf node
-        visitDocValues(visitor, getLeafBlockFP());
+        long leafBlockFP = getLeafBlockFP();
+        leafBlockFPs.add(leafBlockFP);
+        //System.out.println("");
+        visitDocValues(visitor, leafBlockFP);
       } else {
+        System.out.println("====================Do I ever come here if yes then we are fucked !!!================================");
         pushLeft();
         visitLeavesOneByOne(visitor);
         pop();
@@ -629,9 +892,32 @@ public class BKDReader extends PointValues {
       }
     }
 
-    private void visitDocValues(PointValues.IntersectVisitor visitor, long fp) throws IOException {
+    /** Best-effort prefetch of a single leaf block starting at file pointer fp. */
+    private void prefetchLeafBlock(IndexInput in, long fp) {
+      try {
+        in.prefetch(fp, 1);
+      } catch (Exception e) {
+        e.printStackTrace();
+        // Best-effort: swallow prefetch failures, do normal reads.
+      }
+    }
+
+    public Set<Long> leafBlocks() {
+
+//      Set<Long> leafBlocks = new HashSet<>();
+//        for (long l : leafBlockFPStack) {
+//            leafBlocks.add(l);
+//        }
+      return new HashSet<>(leafBlockFPs);
+    }
+
+    public void visitDocValues(PointValues.IntersectVisitor visitor, long fp) throws IOException {
       // Leaf node; scan and filter all points in this block:
+      // leaf ordinals are 0..numLeaves-1
+//      ToDo add prefetch leaf block code here
+      //prefetchLeafBlock(leafNodes, fp);
       int count = readDocIDs(leafNodes, fp, scratchIterator);
+      totalDocsVisited += count;
       if (version >= BKDWriter.VERSION_LOW_CARDINALITY_LEAVES) {
         visitDocValuesWithCardinality(
             commonPrefixLengths,
@@ -655,8 +941,11 @@ public class BKDReader extends PointValues {
       }
     }
 
+    int totalDocsVisited = 0;
     private int readDocIDs(IndexInput in, long blockFP, BKDReaderDocIDSetIterator iterator)
         throws IOException {
+      //prefetching leaf block
+      //in.prefetch(blockFP,1);
       in.seek(blockFP);
       // How many points are stored in this leaf cell:
       int count = in.readVInt();
@@ -901,6 +1190,7 @@ public class BKDReader extends PointValues {
         int length = in.readVInt();
         for (int dim = 0; dim < config.numDims(); dim++) {
           int prefix = commonPrefixLengths[dim];
+          //Is this resulting in a page fault ?
           in.readBytes(
               scratchPackedValue,
               dim * config.bytesPerDim() + prefix,
@@ -1076,3 +1366,4 @@ public class BKDReader extends PointValues {
     }
   }
 }
+

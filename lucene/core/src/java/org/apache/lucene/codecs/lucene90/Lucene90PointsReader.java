@@ -74,7 +74,7 @@ public class Lucene90PointsReader extends PointsReader {
       // Points read whole ranges of bytes at once, so pass ReadAdvice.NORMAL to perform readahead.
       dataIn =
           readState.directory.openInput(
-              dataFileName, readState.context.withReadAdvice(ReadAdvice.NORMAL));
+              dataFileName, readState.context.withReadAdvice(ReadAdvice.RANDOM));
       CodecUtil.checkIndexHeader(
           dataIn,
           Lucene90PointsFormat.DATA_CODEC_NAME,
@@ -157,3 +157,4 @@ public class Lucene90PointsReader extends PointsReader {
     readers.clear();
   }
 }
+

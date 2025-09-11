@@ -41,7 +41,7 @@ import org.apache.lucene.codecs.CompoundFormat;
  */
 public abstract class IndexInput extends DataInput implements Closeable {
 
-  private final String resourceDescription;
+  public final String resourceDescription;
 
   /**
    * resourceDescription should be a non-null, opaque string describing this resource; it's returned

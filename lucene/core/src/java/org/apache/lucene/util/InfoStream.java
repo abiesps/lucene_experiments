@@ -19,7 +19,7 @@ package org.apache.lucene.util;
 import java.io.Closeable;
 import org.apache.lucene.index.IndexWriter; // javadocs
 import org.apache.lucene.index.SegmentInfos; // javadocs
-
+import java.util.logging.Level;
 /**
  * Debugging API for Lucene classes such as {@link IndexWriter} and {@link SegmentInfos}.
  *
@@ -54,7 +54,9 @@ public abstract class InfoStream implements Closeable {
   public abstract boolean isEnabled(String component);
 
   @SuppressWarnings("NonFinalStaticField")
-  private static InfoStream defaultInfoStream = NO_OUTPUT;
+  private static InfoStream defaultInfoStream = 
+  new JavaLoggingInfoStream(Level.INFO);
+  //NO_OUTPUT;
 
   /**
    * The default {@code InfoStream} used by a newly instantiated classes.
