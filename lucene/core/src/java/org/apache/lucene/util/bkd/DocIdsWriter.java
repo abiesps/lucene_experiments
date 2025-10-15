@@ -309,6 +309,23 @@ final class DocIdsWriter {
     assert pos == count : "pos: " + pos + ", count: " + count;
   }
 
+  private static void readDelta16AfterPrefetch(IndexInput in, int count, int[] docIds) throws IOException {
+    final int min = in.readVInt();
+    final int half = count >> 1;
+    in.readInts(docIds, 0, half);
+    if (count == BKDConfig.DEFAULT_MAX_POINTS_IN_LEAF_NODE) {
+      // Same format, but enabling the JVM to specialize the decoding logic for the default number
+      // of points per node proved to help on benchmarks
+      decode16(docIds, BKDConfig.DEFAULT_MAX_POINTS_IN_LEAF_NODE / 2, min);
+    } else {
+      decode16(docIds, half, min);
+    }
+    // read the remaining doc if count is odd.
+    for (int i = half << 1; i < count; i++) {
+      docIds[i] = Short.toUnsignedInt(in.readShort()) + min;
+    }
+  }
+
   private static void readDelta16(IndexInput in, int count, int[] docIds) throws IOException {
     final int min = in.readVInt();
     final int half = count >> 1;
@@ -436,6 +453,41 @@ final class DocIdsWriter {
     in.readInts(docIDs, 0, count);
   }
 
+
+
+  void readIntsAfterPrefetch(IndexInput in, int count, IntersectVisitor visitor, int[] buffer) throws IOException {
+    final int bpv = in.readByte();
+    switch (bpv) {
+      case CONTINUOUS_IDS:
+        readContinuousIdsAfterPrefetch(in, count, visitor);
+        break;
+      case BITSET_IDS:
+        readBitSetAfterPrefetch(in, count, visitor);
+        break;
+      case DELTA_BPV_16:
+        readDelta16AfterPrefetch(in, count, visitor);
+        break;
+      case BPV_21:
+        readInts21AfterPrefetch(in, count, visitor, buffer);
+        break;
+      case BPV_24:
+        if (version < BKDWriter.VERSION_VECTORIZE_BPV24_AND_INTRODUCE_BPV21) {
+          readScalarInts24AfterPrefetch(in, count, visitor);
+        } else {
+          readInts24AfterPrefetch(in, count, visitor, buffer);
+        }
+        break;
+      case BPV_32:
+        readInts32AfterPrefetch(in, count, visitor);
+        break;
+      case LEGACY_DELTA_VINT:
+        readLegacyDeltaVIntsAfterPrefetch(in, count, visitor);
+        break;
+      default:
+        throw new IOException("Unsupported number of bits per value: " + bpv);
+    }
+  }
+
   /**
    * Read {@code count} integers and feed the result directly to {@link
    * IntersectVisitor#visit(int)}.
@@ -479,10 +531,21 @@ final class DocIdsWriter {
     visitor.visit(bitSetIterator);
   }
 
+  private void readBitSetAfterPrefetch(IndexInput in, int count, IntersectVisitor visitor) throws IOException {
+    DocIdSetIterator bitSetIterator = readBitSetIterator(in, count);
+    visitor.visitAfterPrefetch(bitSetIterator);
+  }
+
   private static void readContinuousIds(IndexInput in, int count, IntersectVisitor visitor)
       throws IOException {
     int start = in.readVInt();
     visitor.visit(DocIdSetIterator.range(start, start + count));
+  }
+
+  private static void readContinuousIdsAfterPrefetch(IndexInput in, int count, IntersectVisitor visitor)
+          throws IOException {
+    int start = in.readVInt();
+    visitor.visitAfterPrefetch(DocIdSetIterator.range(start, start + count));
   }
 
   private static void readLegacyDeltaVInts(IndexInput in, int count, IntersectVisitor visitor)
@@ -494,11 +557,27 @@ final class DocIdsWriter {
     }
   }
 
+  private static void readLegacyDeltaVIntsAfterPrefetch(IndexInput in, int count, IntersectVisitor visitor)
+          throws IOException {
+    int doc = 0;
+    for (int i = 0; i < count; i++) {
+      doc += in.readVInt();
+      visitor.visitAfterPrefetch(doc);
+    }
+  }
+
   private void readDelta16(IndexInput in, int count, IntersectVisitor visitor) throws IOException {
     readDelta16(in, count, scratch);
     scratchIntsRef.ints = scratch;
     scratchIntsRef.length = count;
     visitor.visit(scratchIntsRef);
+  }
+
+  private void readDelta16AfterPrefetch(IndexInput in, int count, IntersectVisitor visitor) throws IOException {
+    readDelta16(in, count, scratch);
+    scratchIntsRef.ints = scratch;
+    scratchIntsRef.length = count;
+    visitor.visitAfterPrefetch(scratchIntsRef);
   }
 
   private void readInts21(IndexInput in, int count, IntersectVisitor visitor, int[] buffer)
@@ -509,6 +588,14 @@ final class DocIdsWriter {
     visitor.visit(scratchIntsRef);
   }
 
+  private void readInts21AfterPrefetch(IndexInput in, int count, IntersectVisitor visitor, int[] buffer)
+          throws IOException {
+    readInts21(in, count, buffer);
+    scratchIntsRef.ints = buffer;
+    scratchIntsRef.length = count;
+    visitor.visitAfterPrefetch(scratchIntsRef);
+  }
+
   private void readInts24(IndexInput in, int count, IntersectVisitor visitor, int[] buffer)
       throws IOException {
     readInts24(in, count, buffer);
@@ -517,12 +604,35 @@ final class DocIdsWriter {
     visitor.visit(scratchIntsRef);
   }
 
+  private void readInts24AfterPrefetch(IndexInput in, int count, IntersectVisitor visitor, int[] buffer)
+          throws IOException {
+    readInts24(in, count, buffer);
+    scratchIntsRef.ints = buffer;
+    scratchIntsRef.length = count;
+    visitor.visitAfterPrefetch(scratchIntsRef);
+  }
+
   private void readScalarInts24(IndexInput in, int count, IntersectVisitor visitor)
       throws IOException {
     readScalarInts24(in, count, scratch);
     scratchIntsRef.ints = scratch;
     scratchIntsRef.length = count;
     visitor.visit(scratchIntsRef);
+  }
+
+  private void readScalarInts24AfterPrefetch(IndexInput in, int count, IntersectVisitor visitor)
+          throws IOException {
+    readScalarInts24(in, count, scratch);
+    scratchIntsRef.ints = scratch;
+    scratchIntsRef.length = count;
+    visitor.visitAfterPrefetch(scratchIntsRef);
+  }
+
+  private void readInts32AfterPrefetch(IndexInput in, int count, IntersectVisitor visitor) throws IOException {
+    in.readInts(scratch, 0, count);
+    scratchIntsRef.ints = scratch;
+    scratchIntsRef.length = count;
+    visitor.visitAfterPrefetch(scratchIntsRef);
   }
 
   private void readInts32(IndexInput in, int count, IntersectVisitor visitor) throws IOException {
