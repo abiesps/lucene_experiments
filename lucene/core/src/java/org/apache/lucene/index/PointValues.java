@@ -20,6 +20,11 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.math.BigInteger;
 import java.net.InetAddress;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
 import org.apache.lucene.document.BinaryPoint;
 import org.apache.lucene.document.DoublePoint;
 import org.apache.lucene.document.Field;
@@ -29,10 +34,12 @@ import org.apache.lucene.document.IntPoint;
 import org.apache.lucene.document.LatLonPoint;
 import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.ArrayUtil.ByteArrayComparator;
 import org.apache.lucene.util.IntsRef;
 import org.apache.lucene.util.bkd.BKDConfig;
+import org.apache.lucene.util.bkd.BKDReader;
 
 /**
  * Access to indexed numeric values.
@@ -272,12 +279,31 @@ public abstract class PointValues {
     /** Visit all the docs below the current node. */
     void visitDocIDs(IntersectVisitor visitor) throws IOException;
 
-    //void prefetchDocIDs(IntersectVisitor visitor) throws IOException;
-
     /** Visit all the docs and values below the current node. */
     void visitDocValues(IntersectVisitor visitor) throws IOException;
 
-    default void  prefetchDocValues(IntersectVisitor visitor) throws IOException {};
+    default void prefetchDocValues(IntersectVisitor visitor) throws IOException {};
+
+    default void prefetchDocIDs(IntersectVisitor visitor) throws IOException {};
+
+    //visit all matching doc IDs
+    default void visitMatchingDocIDs(IntersectVisitor visitor) throws IOException{};
+
+    //visit all matching doc values
+    default void visitMatchingDocValues(IntersectVisitor visitor) throws IOException{};
+
+    default String name() {
+      return "not_set";
+    }
+
+    default IndexInput leaves() {
+      return null;
+    }
+
+    default BKDConfig config() {
+      return null;
+    }
+
   }
 
   /**
@@ -335,6 +361,31 @@ public abstract class PointValues {
       }
     }
 
+    default void visitAfterPrefetch(int docID) throws IOException {};
+
+    default void visitAfterPrefetch(DocIdSetIterator iterator, byte[] packedValue) throws IOException {
+      int docID;
+      while ((docID = iterator.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+        visitAfterPrefetch(docID, packedValue);
+      }
+    }
+
+    default void visitAfterPrefetch(int docID, byte[] packedValue) throws IOException {};
+
+    default void visitAfterPrefetch(IntsRef ref) throws IOException {
+      for (int i = ref.offset; i < ref.length + ref.offset; i++) {
+        visitAfterPrefetch(ref.ints[i]);
+      }
+    }
+
+    default void visitAfterPrefetch(DocIdSetIterator iterator) throws IOException {
+      int docID;
+      while ((docID = iterator.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+        visitAfterPrefetch(docID);
+      }
+    }
+
+
     /**
      * Called for non-leaf cells to test how the cell relates to the query, to determine how to
      * further recurse down the tree.
@@ -343,6 +394,46 @@ public abstract class PointValues {
 
     /** Notifies the caller that this many documents are about to be visited */
     default void grow(int count) {}
+
+
+    default void matchedLeafFpDocIds(long fp, int count) {};
+
+    default void matchedLeafFpDocValues(long fp) {};
+
+    default List<Long> matchingLeafNodesfpDocIds() {
+      return Collections.emptyList();
+    }
+
+    default List<Long> matchingLeafNodesfpDocValues() {
+      return Collections.emptyList();
+    }
+
+    default void matchedLeafOrdinalDocIds(int leafOrdinal, long fp, int count) {};
+
+    default void matchedLeafOrdinalDocValues(int leafOrdinal, long fp) {};
+
+
+    default Map<Integer,Long> matchingLeafNodesDocValues() {
+      return Collections.emptyMap();
+    }
+
+    default Map<Integer,Long> matchingLeafNodesDocIds() {
+      return Collections.emptyMap();
+    }
+
+    default int lastMatchingLeafOrdinal() {
+      return -1;
+    }
+
+    default void setLastMatchingLeafOrdinal(int leafOrdinal) {}
+
+    default void traversedNode(int nodeId) {
+
+    }
+
+    default Set<Integer> nodeIds() {
+      return Collections.emptySet();
+    }
   }
 
   /**
@@ -499,4 +590,3 @@ public abstract class PointValues {
   /** Returns the total number of documents that have indexed at least one point. */
   public abstract int getDocCount();
 }
-
