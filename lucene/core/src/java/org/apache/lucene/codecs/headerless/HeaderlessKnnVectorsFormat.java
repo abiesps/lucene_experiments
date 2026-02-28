@@ -20,13 +20,13 @@ import java.io.IOException;
 import org.apache.lucene.codecs.KnnVectorsFormat;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.KnnVectorsWriter;
-import org.apache.lucene.codecs.lucene104.Lucene104HnswVectorsFormat;
+import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 
 /** Headerless KNN vectors format. */
 public final class HeaderlessKnnVectorsFormat extends KnnVectorsFormat {
-  private final Lucene104HnswVectorsFormat delegate = new Lucene104HnswVectorsFormat();
+  private final Lucene99HnswVectorsFormat delegate = new Lucene99HnswVectorsFormat();
 
   public HeaderlessKnnVectorsFormat() {
     super("HeaderlessKnnVectors");
@@ -40,5 +40,10 @@ public final class HeaderlessKnnVectorsFormat extends KnnVectorsFormat {
   @Override
   public KnnVectorsReader fieldsReader(SegmentReadState state) throws IOException {
     return delegate.fieldsReader(state);
+  }
+
+  @Override
+  public int getMaxDimensions(String fieldName) {
+    return delegate.getMaxDimensions(fieldName);
   }
 }

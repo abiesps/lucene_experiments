@@ -20,13 +20,13 @@ import java.io.IOException;
 import org.apache.lucene.codecs.DocValuesConsumer;
 import org.apache.lucene.codecs.DocValuesFormat;
 import org.apache.lucene.codecs.DocValuesProducer;
-import org.apache.lucene.codecs.lucene104.Lucene104DocValuesFormat;
+import org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 
 /** Headerless doc values format. */
 public final class HeaderlessDocValuesFormat extends DocValuesFormat {
-  private final Lucene104DocValuesFormat delegate = new Lucene104DocValuesFormat();
+  private final Lucene90DocValuesFormat delegate = new Lucene90DocValuesFormat();
 
   public HeaderlessDocValuesFormat() {
     super("HeaderlessDocValues");

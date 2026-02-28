@@ -64,7 +64,7 @@ public final class HeaderlessPostingsFormat extends PostingsFormat {
         headerlessDir,
         state.segmentInfo,
         state.fieldInfos,
-        state.segmentUpdates,
+        state.segUpdates,
         state.context);
 
     // Use standard Lucene104 implementation

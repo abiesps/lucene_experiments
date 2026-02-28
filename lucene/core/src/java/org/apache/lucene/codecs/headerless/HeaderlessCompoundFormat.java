@@ -19,19 +19,19 @@ package org.apache.lucene.codecs.headerless;
 import java.io.IOException;
 import org.apache.lucene.codecs.CompoundDirectory;
 import org.apache.lucene.codecs.CompoundFormat;
-import org.apache.lucene.codecs.lucene104.Lucene104CompoundFormat;
+import org.apache.lucene.codecs.lucene90.Lucene90CompoundFormat;
 import org.apache.lucene.index.SegmentInfo;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 
 /** Headerless compound format. */
 public final class HeaderlessCompoundFormat extends CompoundFormat {
-  private final Lucene104CompoundFormat delegate = new Lucene104CompoundFormat();
+  private final Lucene90CompoundFormat delegate = new Lucene90CompoundFormat();
 
   @Override
-  public CompoundDirectory getCompoundReader(Directory dir, SegmentInfo si, IOContext context)
+  public CompoundDirectory getCompoundReader(Directory dir, SegmentInfo si)
       throws IOException {
-    return delegate.getCompoundReader(dir, si, context);
+    return delegate.getCompoundReader(dir, si);
   }
 
   @Override

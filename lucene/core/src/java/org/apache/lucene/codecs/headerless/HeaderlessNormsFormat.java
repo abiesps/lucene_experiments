@@ -20,13 +20,13 @@ import java.io.IOException;
 import org.apache.lucene.codecs.NormsConsumer;
 import org.apache.lucene.codecs.NormsFormat;
 import org.apache.lucene.codecs.NormsProducer;
-import org.apache.lucene.codecs.lucene104.Lucene104NormsFormat;
+import org.apache.lucene.codecs.lucene90.Lucene90NormsFormat;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 
 /** Headerless norms format. */
 public final class HeaderlessNormsFormat extends NormsFormat {
-  private final Lucene104NormsFormat delegate = new Lucene104NormsFormat();
+  private final Lucene90NormsFormat delegate = new Lucene90NormsFormat();
 
   @Override
   public NormsConsumer normsConsumer(SegmentWriteState state) throws IOException {

@@ -20,13 +20,13 @@ import java.io.IOException;
 import org.apache.lucene.codecs.PointsFormat;
 import org.apache.lucene.codecs.PointsReader;
 import org.apache.lucene.codecs.PointsWriter;
-import org.apache.lucene.codecs.lucene104.Lucene104PointsFormat;
+import org.apache.lucene.codecs.lucene90.Lucene90PointsFormat;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 
 /** Headerless points format. */
 public final class HeaderlessPointsFormat extends PointsFormat {
-  private final Lucene104PointsFormat delegate = new Lucene104PointsFormat();
+  private final Lucene90PointsFormat delegate = new Lucene90PointsFormat();
 
   @Override
   public PointsWriter fieldsWriter(SegmentWriteState state) throws IOException {
