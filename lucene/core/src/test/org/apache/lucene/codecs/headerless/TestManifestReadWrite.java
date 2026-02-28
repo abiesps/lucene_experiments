@@ -207,7 +207,7 @@ public class TestManifestReadWrite extends LuceneTestCase {
     dir.close();
   }
 
-  public void testInvalidSegmentId() {
+  public void testInvalidSegmentId() throws IOException {
     ManifestWriter writer = new ManifestWriter();
     writer.addFile("_0.doc", "TestCodec", 1, 1000L, null);
 
@@ -218,7 +218,7 @@ public class TestManifestReadWrite extends LuceneTestCase {
       writer.write(dir, "_0", invalidId, "");
     });
 
-    dir.closeQuietly();
+    dir.close();
   }
 
   public void testClearManifest() throws IOException {
