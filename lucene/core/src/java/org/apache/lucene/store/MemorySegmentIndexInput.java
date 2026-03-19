@@ -335,24 +335,15 @@ abstract class MemorySegmentIndexInput extends IndexInput implements MemorySegme
 
     ensureOpen();
 
-    if (BitUtil.isZeroOrPowerOfTwo(sharedPrefetchCounter.getAndIncrement()) == false) {
-      // We've had enough consecutive hits on the page cache that this number is neither zero nor a
-      // power of two. There is a good chance that a good chunk of this index input is cached in
-      // physical memory. Let's skip the overhead of the madvise system call, we'll be trying again
-      // on the next power of two of the counter.
-      return;
-    }
-
+    // POC: Remove backoff logic — always issue madvise for cold-path prefetch evaluation.
+    // The original backoff skips prefetch when pages are likely cached, but with Direct I/O
+    // on EFS there is no kernel page cache, so we always need explicit prefetch.
     final NativeAccess nativeAccess = NATIVE_ACCESS.get();
     advise(
         offset,
         length,
         segment -> {
-          if (segment.isLoaded() == false) {
-            // We have a cache miss on at least one page, let's reset the counter.
-            sharedPrefetchCounter.set(0);
-            nativeAccess.madviseWillNeed(segment);
-          }
+          nativeAccess.madviseWillNeed(segment);
         });
   }
 

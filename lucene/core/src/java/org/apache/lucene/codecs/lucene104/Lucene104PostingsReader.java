@@ -972,6 +972,18 @@ public final class Lucene104PostingsReader extends PostingsReaderBase {
         return;
       }
 
+      // Prefetch upcoming postings blocks for disjunction queries.
+      // BooleanScorer calls intoBitSet() with a window of 4096 doc IDs.
+      // Each block is BLOCK_SIZE=256 docs, encoded as ~1KB on disk.
+      // Prefetch up to 16 blocks ahead (~16KB) to cover the window.
+      // Conjunction queries use advance() and never call intoBitSet(), so this is non-speculative.
+      if (docCountLeft > 0 && docIn != null) {
+        int blocksAhead = Math.min(docCountLeft / BLOCK_SIZE, 16);
+        if (blocksAhead > 0) {
+          docIn.prefetch(docIn.getFilePointer(), blocksAhead * 1024L);
+        }
+      }
+
       // Handle the current doc separately, it may be on the previous docBuffer.
       bitSet.set(doc - offset);
 

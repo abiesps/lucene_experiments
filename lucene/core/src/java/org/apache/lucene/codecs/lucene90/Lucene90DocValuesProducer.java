@@ -35,6 +35,7 @@ import org.apache.lucene.index.ImpactsEnum;
 import org.apache.lucene.index.IndexFileNames;
 import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.PostingsEnum;
+import org.apache.lucene.index.PrefetchableDocValues;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
@@ -516,6 +517,82 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     }
   }
 
+  /**
+   * Dense numeric doc values that implement PrefetchableDocValues. Computes byte offsets from doc
+   * IDs using bitsPerValue, deduplicates pages, and issues prefetch calls.
+   */
+  private abstract static class PrefetchableDenseNumericDocValues extends DenseNumericDocValues
+      implements PrefetchableDocValues {
+
+    final RandomAccessInput slice;
+    final int bitsPerValue;
+
+    PrefetchableDenseNumericDocValues(int maxDoc, RandomAccessInput slice, int bitsPerValue) {
+      super(maxDoc);
+      this.slice = slice;
+      this.bitsPerValue = bitsPerValue;
+    }
+
+    @Override
+    public void prefetchExact(int[] docs, int count) throws IOException {
+      if (count == 0 || bitsPerValue == 0) return;
+      final long PAGE_SIZE = 4096L;
+      long lastPrefetchedPage = -1;
+      for (int i = 0; i < count; i++) {
+        long byteOffset = ((long) docs[i] * bitsPerValue) >>> 3;
+        long page = byteOffset / PAGE_SIZE;
+        if (page != lastPrefetchedPage) {
+          long pageStart = page * PAGE_SIZE;
+          long len = Math.min(PAGE_SIZE, slice.length() - pageStart);
+          if (len > 0) {
+            slice.prefetch(pageStart, len);
+          }
+          lastPrefetchedPage = page;
+        }
+      }
+    }
+  }
+
+  /**
+   * Sparse numeric doc values that implement PrefetchableDocValues. Same prefetch logic as dense
+   * but uses disi.index() for the byte offset computation since sparse values are packed
+   * contiguously by index, not by doc ID.
+   */
+  private abstract static class PrefetchableSparseNumericDocValues extends SparseNumericDocValues
+      implements PrefetchableDocValues {
+
+    final RandomAccessInput slice;
+    final int bitsPerValue;
+
+    PrefetchableSparseNumericDocValues(
+        IndexedDISI disi, RandomAccessInput slice, int bitsPerValue) {
+      super(disi);
+      this.slice = slice;
+      this.bitsPerValue = bitsPerValue;
+    }
+
+    @Override
+    public void prefetchExact(int[] docs, int count) throws IOException {
+      // For sparse doc values, we can't compute the exact index from the doc ID without
+      // calling advanceExact, which would change iterator state. Instead, we prefetch a
+      // conservative range based on the doc ID span. The actual values are packed by index
+      // (not doc ID), so we estimate the index range.
+      if (count == 0 || bitsPerValue == 0) return;
+      final long PAGE_SIZE = 4096L;
+      // Estimate: prefetch pages covering index range [0, count) worth of values
+      // since we'll read exactly `count` values in order
+      long maxByteOffset = ((long) count * bitsPerValue) >>> 3;
+      long numPages = (maxByteOffset / PAGE_SIZE) + 1;
+      for (long page = 0; page < numPages && page * PAGE_SIZE < slice.length(); page++) {
+        long pageStart = page * PAGE_SIZE;
+        long len = Math.min(PAGE_SIZE, slice.length() - pageStart);
+        if (len > 0) {
+          slice.prefetch(pageStart, len);
+        }
+      }
+    }
+  }
+
   private LongValues getDirectReaderInstance(
       RandomAccessInput slice, int bitsPerValue, long offset, long numValues) {
     if (merging) {
@@ -541,11 +618,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       } else {
         final RandomAccessInput slice =
             data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
-        // Prefetch the first page of data. Following pages are expected to get prefetched through
-        // read-ahead.
-        if (slice.length() > 0) {
-          slice.prefetch(0, 1);
-        }
         if (entry.blockShift >= 0) {
           // dense but split into blocks of different bits per value
           return new DenseNumericDocValues(maxDoc) {
@@ -569,7 +641,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             };
           } else if (entry.gcd == 1 && entry.minValue == 0) {
             // Common case for ordinals, which are encoded as numerics
-            return new DenseNumericDocValues(maxDoc) {
+            return new PrefetchableDenseNumericDocValues(maxDoc, slice, entry.bitsPerValue) {
               @Override
               public long longValue() throws IOException {
                 return values.get(doc);
@@ -578,7 +650,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           } else {
             final long mul = entry.gcd;
             final long delta = entry.minValue;
-            return new DenseNumericDocValues(maxDoc) {
+            return new PrefetchableDenseNumericDocValues(maxDoc, slice, entry.bitsPerValue) {
               @Override
               public long longValue() throws IOException {
                 return mul * values.get(doc) + delta;
@@ -607,11 +679,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       } else {
         final RandomAccessInput slice =
             data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
-        // Prefetch the first page of data. Following pages are expected to get prefetched through
-        // read-ahead.
-        if (slice.length() > 0) {
-          slice.prefetch(0, 1);
-        }
         if (entry.blockShift >= 0) {
           // sparse and split into blocks of different bits per value
           return new SparseNumericDocValues(disi) {
@@ -635,7 +702,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               }
             };
           } else if (entry.gcd == 1 && entry.minValue == 0) {
-            return new SparseNumericDocValues(disi) {
+            return new PrefetchableSparseNumericDocValues(disi, slice, entry.bitsPerValue) {
               @Override
               public long longValue() throws IOException {
                 return values.get(disi.index());
@@ -644,7 +711,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           } else {
             final long mul = entry.gcd;
             final long delta = entry.minValue;
-            return new SparseNumericDocValues(disi) {
+            return new PrefetchableSparseNumericDocValues(disi, slice, entry.bitsPerValue) {
               @Override
               public long longValue() throws IOException {
                 return mul * values.get(disi.index()) + delta;
