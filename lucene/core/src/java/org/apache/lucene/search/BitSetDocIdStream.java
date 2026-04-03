@@ -58,4 +58,25 @@ final class BitSetDocIdStream extends DocIdStream {
       return 0;
     }
   }
+
+  @Override
+  public int intoArray(int upTo, int[] array) {
+    if (upTo > this.upTo) {
+      upTo = Math.min(upTo, max);
+      int count = 0;
+      int from = this.upTo - offset;
+      int to = upTo - offset;
+      for (int i = bitSet.nextSetBit(from); i >= 0 && i < to && count < array.length; i = bitSet.nextSetBit(i + 1)) {
+        array[count++] = i + offset;
+      }
+      if (count == array.length && count > 0) {
+        // We filled the array, update upTo to just past the last doc we copied
+        this.upTo = array[count - 1] + 1;
+      } else {
+        this.upTo = upTo;
+      }
+      return count;
+    }
+    return 0;
+  }
 }

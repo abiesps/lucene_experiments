@@ -43,6 +43,29 @@ public abstract class SortedDocValues extends DocValuesIterator {
   public abstract int ordValue() throws IOException;
 
   /**
+   * Retrieves ordinals for a batch of doc IDs. The docs array must be sorted ascending with no
+   * duplicates.
+   *
+   * <p>The default implementation loops over each doc, calling {@link #advanceExact(int)} and {@link
+   * #ordValue()} for docs that have a value, or storing {@code defaultOrd} for docs without a
+   * value. Subclasses may override this method to prefetch data and improve I/O efficiency.
+   *
+   * @param size number of doc IDs to process
+   * @param docs sorted ascending doc IDs (no duplicates)
+   * @param ords output array for ordinals
+   * @param defaultOrd value to use for docs without a value (typically -1)
+   */
+  public void ordValues(int size, int[] docs, int[] ords, int defaultOrd) throws IOException {
+    for (int i = 0; i < size; i++) {
+      if (advanceExact(docs[i])) {
+        ords[i] = ordValue();
+      } else {
+        ords[i] = defaultOrd;
+      }
+    }
+  }
+
+  /**
    * Retrieves the value for the specified ordinal. The returned {@link BytesRef} may be re-used
    * across calls to {@link #lookupOrd(int)} so make sure to {@link BytesRef#deepCopyOf(BytesRef)
    * copy it} if you want to keep it around.
