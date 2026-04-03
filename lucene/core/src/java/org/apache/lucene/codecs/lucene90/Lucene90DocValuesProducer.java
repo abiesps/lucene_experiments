@@ -1661,6 +1661,16 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           public int docIDRunEnd() throws IOException {
             return maxDoc;
           }
+
+          @Override
+          public void ordValues(int size, int[] docs, int[] ords, int defaultOrd)
+              throws IOException {
+            if (size == 0) return;
+            prefetchFixedBPV(size, docs, slice, ordsEntry.bitsPerValue);
+            for (int i = 0; i < size; i++) {
+              ords[i] = (int) values.get(docs[i]);
+            }
+          }
         };
       } else if (ordsEntry.docsWithFieldOffset >= 0) { // sparse but non-empty
         final IndexedDISI disi =
@@ -1673,6 +1683,9 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
                 ordsEntry.numValues);
 
         return new BaseSortedDocValues(entry) {
+
+          private final int[] indexScratch = new int[4096];
+          private final boolean[] existsScratch = new boolean[4096];
 
           @Override
           public int ordValue() throws IOException {
@@ -1713,12 +1726,100 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           public int docIDRunEnd() throws IOException {
             return disi.docIDRunEnd();
           }
+
+          @Override
+          public void ordValues(int size, int[] docs, int[] ords, int defaultOrd)
+              throws IOException {
+            if (size == 0) return;
+
+            // Step 1: Compute density ratio for adaptive DISI prefetch strategy
+            final boolean perDoc;
+            if (size == 1) {
+              perDoc = true;
+            } else {
+              long densityRatio = ((long) docs[size - 1] - docs[0]) / size;
+              perDoc = usePerDocPrefetch(densityRatio, Integer.BYTES * 2 * 8, 1);
+            }
+
+            // Step 2: Prefetch DISI structures (jump table + data blocks)
+            final RandomAccessInput jumpTable = disi.jumpTable;
+            final IndexInput disiSlice = disi.slice;
+            if (jumpTable != null) {
+              final int firstBlock = docs[0] >>> 16;
+              final int lastBlock = docs[size - 1] >>> 16;
+              if (perDoc) {
+                int prevBlock = -1;
+                for (int i = 0; i < size; i++) {
+                  int block = docs[i] >>> 16;
+                  if (block != prevBlock && block < disi.jumpTableEntryCount) {
+                    long jtOffset = (long) block * Integer.BYTES * 2;
+                    jumpTable.prefetch(jtOffset, Integer.BYTES * 2);
+                    prevBlock = block;
+                  }
+                }
+                prevBlock = -1;
+                for (int i = 0; i < size; i++) {
+                  int block = docs[i] >>> 16;
+                  if (block != prevBlock && block < disi.jumpTableEntryCount) {
+                    long jtOffset = (long) block * Integer.BYTES * 2;
+                    int dataOffset = jumpTable.readInt(jtOffset + Integer.BYTES);
+                    disiSlice.prefetch(dataOffset, 1);
+                    prevBlock = block;
+                  }
+                }
+              } else {
+                int clampedFirst = Math.min(firstBlock, disi.jumpTableEntryCount - 1);
+                int clampedLast = Math.min(lastBlock, disi.jumpTableEntryCount - 1);
+                if (clampedFirst >= 0 && clampedLast >= clampedFirst) {
+                  long jtFirstByte = (long) clampedFirst * Integer.BYTES * 2;
+                  long jtLastByte = ((long) clampedLast + 1) * Integer.BYTES * 2;
+                  jumpTable.prefetch(jtFirstByte, jtLastByte - jtFirstByte);
+                  int dataStartOffset = jumpTable.readInt(jtFirstByte + Integer.BYTES);
+                  int dataEndOffset =
+                      jumpTable.readInt((long) clampedLast * Integer.BYTES * 2 + Integer.BYTES);
+                  if (dataEndOffset >= dataStartOffset) {
+                    disiSlice.prefetch(
+                        dataStartOffset, (long) dataEndOffset - dataStartOffset + (1 << 13));
+                  }
+                }
+              }
+            }
+
+            // Step 3: Traverse DISI, record existence and indices
+            int existingCount = 0;
+            for (int i = 0; i < size; i++) {
+              if (disi.advanceExact(docs[i])) {
+                indexScratch[existingCount] = disi.index();
+                existsScratch[i] = true;
+                existingCount++;
+              } else {
+                existsScratch[i] = false;
+              }
+            }
+
+            // Step 4: Prefetch ordinal data using DISI indices
+            if (existingCount > 0) {
+              prefetchFixedBPV(existingCount, indexScratch, slice, ordsEntry.bitsPerValue);
+            }
+
+            // Step 5: Read ordinals
+            int idx = 0;
+            for (int i = 0; i < size; i++) {
+              if (existsScratch[i]) {
+                ords[i] = (int) values.get(indexScratch[idx++]);
+              } else {
+                ords[i] = defaultOrd;
+              }
+            }
+          }
         };
       }
     }
 
     final NumericDocValues ords = getNumeric(entry.ordsEntry);
     return new BaseSortedDocValues(entry) {
+
+      private final long[] longScratch = new long[4096];
 
       @Override
       public int ordValue() throws IOException {
@@ -1753,6 +1854,15 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       @Override
       public int docIDRunEnd() throws IOException {
         return ords.docIDRunEnd();
+      }
+
+      @Override
+      public void ordValues(int size, int[] docs, int[] ords2, int defaultOrd)
+          throws IOException {
+        ords.longValues(size, docs, longScratch, defaultOrd);
+        for (int i = 0; i < size; i++) {
+          ords2[i] = (int) longScratch[i];
+        }
       }
     };
   }
@@ -1794,6 +1904,65 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     @Override
     public TermsEnum termsEnum() throws IOException {
       return new TermsDict(entry.termsDictEntry, data);
+    }
+
+    /**
+     * Prefetches term dictionary data for a set of ordinals so that subsequent lookupOrd calls find
+     * the LZ4 blocks warm in the cache.
+     *
+     * @param ords array of ordinals to prefetch
+     * @param count number of ordinals in the array
+     */
+    public void prefetchOrdinals(int[] ords, int count) throws IOException {
+      if (count == 0) return;
+      TermsDict td = (TermsDict) termsEnum;
+
+      // Step 1: Sort ordinals (copy) and compute unique block indices
+      int[] sorted = Arrays.copyOf(ords, count);
+      Arrays.sort(sorted);
+
+      int blockCount = 0;
+      long prevBlock = -1;
+      long[] blockIndices = new long[count];
+      for (int i = 0; i < count; i++) {
+        long blockIndex = Integer.toUnsignedLong(sorted[i]) >> TERMS_DICT_BLOCK_LZ4_SHIFT;
+        if (blockIndex != prevBlock) {
+          blockIndices[blockCount++] = blockIndex;
+          prevBlock = blockIndex;
+        }
+      }
+
+      if (blockCount == 0) return;
+
+      // Pass 1: Prefetch blockAddresses entries for the block index range
+      long firstIdx = blockIndices[0];
+      long lastIdx = blockIndices[blockCount - 1] + 1;
+      long totalBlocks =
+          (td.entry.termsDictSize + (1L << TERMS_DICT_BLOCK_LZ4_SHIFT) - 1)
+              >>> TERMS_DICT_BLOCK_LZ4_SHIFT;
+      // Prefetch the backing RandomAccessInput for the address range
+      td.blockAddressesSlice.prefetch(
+          firstIdx * Long.BYTES,
+          (Math.min(lastIdx, totalBlocks) - firstIdx + 1) * Long.BYTES);
+
+      // Pass 2: Read block addresses, prefetch LZ4 term data blocks
+      for (int i = 0; i < blockCount; i++) {
+        long blockAddress = td.blockAddresses.get(blockIndices[i]);
+        long nextBlockAddress;
+        if (i + 1 < blockCount) {
+          nextBlockAddress = td.blockAddresses.get(blockIndices[i + 1]);
+        } else {
+          long nextBlockIdx = blockIndices[i] + 1;
+          if (nextBlockIdx < totalBlocks) {
+            nextBlockAddress = td.blockAddresses.get(nextBlockIdx);
+          } else {
+            nextBlockAddress = td.entry.termsDataLength;
+          }
+        }
+        if (nextBlockAddress > blockAddress) {
+          td.bytes.prefetch(blockAddress, nextBlockAddress - blockAddress);
+        }
+      }
     }
   }
 
@@ -1837,6 +2006,66 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     public TermsEnum termsEnum() throws IOException {
       return new TermsDict(entry.termsDictEntry, data);
     }
+
+    /**
+     * Prefetches term dictionary data for a set of ordinals so that subsequent lookupOrd calls find
+     * the LZ4 blocks warm in the cache.
+     *
+     * @param ords array of ordinals to prefetch
+     * @param count number of ordinals in the array
+     */
+    @Override
+    public void prefetchOrdinals(long[] ords, int count) throws IOException {
+      if (count == 0) return;
+      TermsDict td = (TermsDict) termsEnum;
+
+      // Step 1: Sort ordinals (copy) and compute unique block indices
+      long[] sorted = Arrays.copyOf(ords, count);
+      Arrays.sort(sorted);
+
+      int blockCount = 0;
+      long prevBlock = -1;
+      long[] blockIndices = new long[count];
+      for (int i = 0; i < count; i++) {
+        long blockIndex = sorted[i] >>> TERMS_DICT_BLOCK_LZ4_SHIFT;
+        if (blockIndex != prevBlock) {
+          blockIndices[blockCount++] = blockIndex;
+          prevBlock = blockIndex;
+        }
+      }
+
+      if (blockCount == 0) return;
+
+      // Pass 1: Prefetch blockAddresses entries for the block index range
+      long firstIdx = blockIndices[0];
+      long lastIdx = blockIndices[blockCount - 1] + 1;
+      long totalBlocks =
+          (td.entry.termsDictSize + (1L << TERMS_DICT_BLOCK_LZ4_SHIFT) - 1)
+              >>> TERMS_DICT_BLOCK_LZ4_SHIFT;
+      // Prefetch the backing RandomAccessInput for the address range
+      td.blockAddressesSlice.prefetch(
+          firstIdx * Long.BYTES,
+          (Math.min(lastIdx, totalBlocks) - firstIdx + 1) * Long.BYTES);
+
+      // Pass 2: Read block addresses, prefetch LZ4 term data blocks
+      for (int i = 0; i < blockCount; i++) {
+        long blockAddress = td.blockAddresses.get(blockIndices[i]);
+        long nextBlockAddress;
+        if (i + 1 < blockCount) {
+          nextBlockAddress = td.blockAddresses.get(blockIndices[i + 1]);
+        } else {
+          long nextBlockIdx = blockIndices[i] + 1;
+          if (nextBlockIdx < totalBlocks) {
+            nextBlockAddress = td.blockAddresses.get(nextBlockIdx);
+          } else {
+            nextBlockAddress = td.entry.termsDataLength;
+          }
+        }
+        if (nextBlockAddress > blockAddress) {
+          td.bytes.prefetch(blockAddress, nextBlockAddress - blockAddress);
+        }
+      }
+    }
   }
 
   private class TermsDict extends BaseTermsEnum {
@@ -1844,6 +2073,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
     final TermsDictEntry entry;
     final LongValues blockAddresses;
+    final RandomAccessInput blockAddressesSlice;
     final IndexInput bytes;
     final long blockMask;
     final LongValues indexAddresses;
@@ -1859,6 +2089,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       this.entry = entry;
       RandomAccessInput addressesSlice =
           data.randomAccessSlice(entry.termsAddressesOffset, entry.termsAddressesLength);
+      this.blockAddressesSlice = addressesSlice;
       blockAddresses =
           DirectMonotonicReader.getInstance(entry.termsAddressesMeta, addressesSlice, merging);
       bytes = data.slice("terms", entry.termsDataOffset, entry.termsDataLength);
@@ -2337,6 +2568,58 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           public int docIDRunEnd() throws IOException {
             return maxDoc;
           }
+
+          @Override
+          public int ordValues(int size, int[] docs, long[] ordsOut, int[] counts)
+              throws IOException {
+            if (size == 0) return 0;
+
+            // Phase 1: Prefetch address table entries for docs[0] to docs[size-1]+1.
+            // The address table is a DirectMonotonicReader backed by addressesInput.
+            // We need entries for docs[0] through docs[size-1]+1 (inclusive end boundary).
+            {
+              long firstPos = docs[0];
+              long lastPos = (long) docs[size - 1] + 1L;
+              // Approximate byte range for the DirectMonotonicReader backing data.
+              // DMR stores values in blocks with base + packed deltas; prefetch the
+              // contiguous region covering the positions we need.
+              long byteStart = firstPos * Long.BYTES;
+              long byteEnd = (lastPos + 1) * Long.BYTES;
+              if (addressesInput.length() > 0) {
+                long clampedStart = Math.min(byteStart, addressesInput.length() - 1);
+                long clampedLen =
+                    Math.min(byteEnd - byteStart, addressesInput.length() - clampedStart);
+                if (clampedLen > 0) {
+                  addressesInput.prefetch(clampedStart, clampedLen);
+                }
+              }
+            }
+
+            // Phase 2: Read addresses to determine ordinal data range, prefetch ordinal data.
+            long firstOrdPos = addresses.get(docs[0]);
+            long lastOrdPos = addresses.get((long) docs[size - 1] + 1L);
+            if (lastOrdPos > firstOrdPos) {
+              long firstByte = (firstOrdPos * ordsEntry.bitsPerValue) / 8;
+              long lastByte = ((lastOrdPos - 1) * ordsEntry.bitsPerValue) / 8 + 8;
+              long clampedLen = Math.min(lastByte - firstByte, slice.length() - firstByte);
+              if (clampedLen > 0) {
+                slice.prefetch(firstByte, clampedLen);
+              }
+            }
+
+            // Phase 3: Read ordinals per doc.
+            int total = 0;
+            for (int i = 0; i < size; i++) {
+              long c = addresses.get(docs[i]);
+              long end = addresses.get((long) docs[i] + 1L);
+              int cnt = (int) (end - c);
+              counts[i] = cnt;
+              for (int j = 0; j < cnt; j++) {
+                ordsOut[total++] = values.get(c++);
+              }
+            }
+            return total;
+          }
         };
       } else if (ordsEntry.docsWithFieldOffset >= 0) { // sparse but non-empty
         final IndexedDISI disi =
@@ -2349,6 +2632,9 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
                 ordsEntry.numValues);
 
         return new BaseSortedSetDocValues(entry, data) {
+
+          private final int[] indexScratch = new int[4096];
+          private final boolean[] existsScratch = new boolean[4096];
 
           boolean set;
           long curr;
@@ -2413,6 +2699,124 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           @Override
           public int docIDRunEnd() throws IOException {
             return disi.docIDRunEnd();
+          }
+
+          @Override
+          public int ordValues(int size, int[] docs, long[] ordsOut, int[] counts)
+              throws IOException {
+            if (size == 0) return 0;
+
+            // Step 1: DISI prefetch + traverse to collect DISI indices.
+            final boolean perDoc;
+            if (size == 1) {
+              perDoc = true;
+            } else {
+              long densityRatio = ((long) docs[size - 1] - docs[0]) / size;
+              perDoc = usePerDocPrefetch(densityRatio, Integer.BYTES * 2 * 8, 1);
+            }
+
+            // Prefetch DISI structures (jump table + data blocks)
+            final RandomAccessInput jumpTable = disi.jumpTable;
+            final IndexInput disiSlice = disi.slice;
+            if (jumpTable != null) {
+              final int firstBlock = docs[0] >>> 16;
+              final int lastBlock = docs[size - 1] >>> 16;
+              if (perDoc) {
+                int prevBlock = -1;
+                for (int i = 0; i < size; i++) {
+                  int block = docs[i] >>> 16;
+                  if (block != prevBlock && block < disi.jumpTableEntryCount) {
+                    long jtOffset = (long) block * Integer.BYTES * 2;
+                    jumpTable.prefetch(jtOffset, Integer.BYTES * 2);
+                    prevBlock = block;
+                  }
+                }
+                prevBlock = -1;
+                for (int i = 0; i < size; i++) {
+                  int block = docs[i] >>> 16;
+                  if (block != prevBlock && block < disi.jumpTableEntryCount) {
+                    long jtOffset = (long) block * Integer.BYTES * 2;
+                    int dataOffset = jumpTable.readInt(jtOffset + Integer.BYTES);
+                    disiSlice.prefetch(dataOffset, 1);
+                    prevBlock = block;
+                  }
+                }
+              } else {
+                int clampedFirst = Math.min(firstBlock, disi.jumpTableEntryCount - 1);
+                int clampedLast = Math.min(lastBlock, disi.jumpTableEntryCount - 1);
+                if (clampedFirst >= 0 && clampedLast >= clampedFirst) {
+                  long jtFirstByte = (long) clampedFirst * Integer.BYTES * 2;
+                  long jtLastByte = ((long) clampedLast + 1) * Integer.BYTES * 2;
+                  jumpTable.prefetch(jtFirstByte, jtLastByte - jtFirstByte);
+                  int dataStartOffset = jumpTable.readInt(jtFirstByte + Integer.BYTES);
+                  int dataEndOffset =
+                      jumpTable.readInt((long) clampedLast * Integer.BYTES * 2 + Integer.BYTES);
+                  if (dataEndOffset >= dataStartOffset) {
+                    disiSlice.prefetch(
+                        dataStartOffset, (long) dataEndOffset - dataStartOffset + (1 << 13));
+                  }
+                }
+              }
+            }
+
+            // Traverse DISI, record existence and DISI indices
+            int existingCount = 0;
+            for (int i = 0; i < size; i++) {
+              if (disi.advanceExact(docs[i])) {
+                indexScratch[existingCount] = disi.index();
+                existsScratch[i] = true;
+                existingCount++;
+              } else {
+                existsScratch[i] = false;
+                counts[i] = 0;
+              }
+            }
+            if (existingCount == 0) return 0;
+
+            // Step 2: Prefetch address table using DISI indices.
+            {
+              long firstPos = indexScratch[0];
+              long lastPos = (long) indexScratch[existingCount - 1] + 1L;
+              long byteStart = firstPos * Long.BYTES;
+              long byteEnd = (lastPos + 1) * Long.BYTES;
+              if (addressesInput.length() > 0) {
+                long clampedStart = Math.min(byteStart, addressesInput.length() - 1);
+                long clampedLen =
+                    Math.min(byteEnd - byteStart, addressesInput.length() - clampedStart);
+                if (clampedLen > 0) {
+                  addressesInput.prefetch(clampedStart, clampedLen);
+                }
+              }
+            }
+
+            // Step 3: Read addresses, prefetch ordinal data range.
+            long firstOrdPos = addresses.get(indexScratch[0]);
+            long lastOrdPos = addresses.get((long) indexScratch[existingCount - 1] + 1L);
+            if (lastOrdPos > firstOrdPos) {
+              long firstByte = (firstOrdPos * ordsEntry.bitsPerValue) / 8;
+              long lastByte = ((lastOrdPos - 1) * ordsEntry.bitsPerValue) / 8 + 8;
+              long clampedLen = Math.min(lastByte - firstByte, slice.length() - firstByte);
+              if (clampedLen > 0) {
+                slice.prefetch(firstByte, clampedLen);
+              }
+            }
+
+            // Step 4: Read ordinals per doc, counts[i] = 0 for missing docs.
+            int total = 0;
+            int idx = 0;
+            for (int i = 0; i < size; i++) {
+              if (existsScratch[i]) {
+                int index = indexScratch[idx++];
+                long c = addresses.get(index);
+                long end = addresses.get((long) index + 1L);
+                int cnt = (int) (end - c);
+                counts[i] = cnt;
+                for (int j = 0; j < cnt; j++) {
+                  ordsOut[total++] = values.get(c++);
+                }
+              }
+            }
+            return total;
           }
         };
       }

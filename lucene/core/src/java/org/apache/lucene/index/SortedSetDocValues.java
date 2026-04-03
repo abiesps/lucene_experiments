@@ -95,6 +95,50 @@ public abstract class SortedSetDocValues extends DocValuesIterator {
   }
 
   /**
+   * Retrieves ordinals for a batch of doc IDs into a flat output array. The {@code docs} array must
+   * be sorted in ascending order with no duplicates.
+   *
+   * <p>The default implementation loops over each doc, calling {@link #advanceExact(int)} and {@link
+   * #nextOrd()} for docs that have values, or setting {@code counts[i] = 0} for docs without
+   * values. Subclasses may override this method to prefetch data and improve I/O efficiency.
+   *
+   * @param size number of doc IDs to process
+   * @param docs sorted ascending doc IDs (no duplicates)
+   * @param ordsOut flat output array for all ordinals across all docs
+   * @param counts output array: counts[i] = number of ordinals for docs[i] (0 if no value)
+   * @return total number of ordinals written to ordsOut
+   */
+  public int ordValues(int size, int[] docs, long[] ordsOut, int[] counts) throws IOException {
+    int total = 0;
+    for (int i = 0; i < size; i++) {
+      if (advanceExact(docs[i])) {
+        int c = docValueCount();
+        counts[i] = c;
+        for (int j = 0; j < c; j++) {
+          ordsOut[total++] = nextOrd();
+        }
+      } else {
+        counts[i] = 0;
+      }
+    }
+    return total;
+  }
+
+  /**
+   * Prefetches term dictionary data for a set of ordinals so that subsequent {@link
+   * #lookupOrd(long)} calls find the data warm in the cache.
+   *
+   * <p>The default implementation is a no-op. Subclasses backed by compressed term dictionaries
+   * (e.g., LZ4-compressed blocks) may override this to pre-warm the cache for the given ordinals.
+   *
+   * @param ords array of ordinals to prefetch
+   * @param count number of ordinals in the array
+   */
+  public void prefetchOrdinals(long[] ords, int count) throws IOException {
+    // no-op by default
+  }
+
+  /**
    * Returns a {@link TermsEnum} over the values. The enum supports {@link TermsEnum#ord()} and
    * {@link TermsEnum#seekExact(long)}.
    */
