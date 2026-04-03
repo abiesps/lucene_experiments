@@ -208,6 +208,39 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
     }
   }
 
+  /**
+   * Prefetches DISI jump table and data blocks for a batch of sorted doc IDs. Computes the DISI
+   * block range from docs[0] >>> 16 to docs[size-1] >>> 16 and prefetches the contiguous range of
+   * jump table entries and data blocks.
+   */
+  private static void prefetchDISI(IndexedDISI disi, int size, int[] docs) throws IOException {
+    final RandomAccessInput jumpTable = disi.jumpTable;
+    final IndexInput disiSlice = disi.slice;
+
+    if (jumpTable == null || size == 0) {
+      return;
+    }
+
+    final int firstBlock = docs[0] >>> 16;
+    final int lastBlock = docs[size - 1] >>> 16;
+
+    // Prefetch jump table entries for the block range
+    int clampedFirst = Math.min(firstBlock, disi.jumpTableEntryCount - 1);
+    int clampedLast = Math.min(lastBlock, disi.jumpTableEntryCount - 1);
+    if (clampedFirst >= 0 && clampedLast >= clampedFirst) {
+      long jtFirstByte = (long) clampedFirst * Integer.BYTES * 2;
+      long jtLastByte = ((long) clampedLast + 1) * Integer.BYTES * 2;
+      jumpTable.prefetch(jtFirstByte, jtLastByte - jtFirstByte);
+
+      // Read first and last jump table entries to get data offset range, prefetch data
+      int dataStartOffset = jumpTable.readInt(jtFirstByte + Integer.BYTES);
+      int dataEndOffset = jumpTable.readInt((long) clampedLast * Integer.BYTES * 2 + Integer.BYTES);
+      if (dataEndOffset >= dataStartOffset) {
+        disiSlice.prefetch(dataStartOffset, (long) dataEndOffset - dataStartOffset + (1 << 13));
+      }
+    }
+  }
+
   private void readFields(IndexInput meta, FieldInfos infos) throws IOException {
     for (int fieldNumber = meta.readInt(); fieldNumber != -1; fieldNumber = meta.readInt()) {
       FieldInfo info = infos.fieldInfo(fieldNumber);
@@ -399,9 +432,15 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             @Override
             public void longValues(int size, int[] docs, long[] values, long defaultValue)
                 throws IOException {
-              // Delegate to help performance: when the super call inlines, calls to
-              // #advanceExact/#longValue become monomorphic.
-              super.longValues(size, docs, values, defaultValue);
+              if (size > 0) {
+                // Prefetch the byte range covering all docs in the batch
+                long firstOffset = docs[0];
+                long lastOffset = docs[size - 1];
+                slice.prefetch(firstOffset, lastOffset - firstOffset + 1);
+              }
+              for (int i = 0; i < size; i++) {
+                values[i] = slice.readByte(docs[i]);
+              }
             }
           };
         case 2:
@@ -410,6 +449,19 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             public long longValue() throws IOException {
               return slice.readShort(((long) doc) << 1);
             }
+
+            @Override
+            public void longValues(int size, int[] docs, long[] values, long defaultValue)
+                throws IOException {
+              if (size > 0) {
+                long firstOffset = ((long) docs[0]) << 1;
+                long lastOffset = ((long) docs[size - 1]) << 1;
+                slice.prefetch(firstOffset, lastOffset - firstOffset + 2);
+              }
+              for (int i = 0; i < size; i++) {
+                values[i] = slice.readShort(((long) docs[i]) << 1);
+              }
+            }
           };
         case 4:
           return new DenseNormsIterator(maxDoc) {
@@ -417,12 +469,38 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             public long longValue() throws IOException {
               return slice.readInt(((long) doc) << 2);
             }
+
+            @Override
+            public void longValues(int size, int[] docs, long[] values, long defaultValue)
+                throws IOException {
+              if (size > 0) {
+                long firstOffset = ((long) docs[0]) << 2;
+                long lastOffset = ((long) docs[size - 1]) << 2;
+                slice.prefetch(firstOffset, lastOffset - firstOffset + 4);
+              }
+              for (int i = 0; i < size; i++) {
+                values[i] = slice.readInt(((long) docs[i]) << 2);
+              }
+            }
           };
         case 8:
           return new DenseNormsIterator(maxDoc) {
             @Override
             public long longValue() throws IOException {
               return slice.readLong(((long) doc) << 3);
+            }
+
+            @Override
+            public void longValues(int size, int[] docs, long[] values, long defaultValue)
+                throws IOException {
+              if (size > 0) {
+                long firstOffset = ((long) docs[0]) << 3;
+                long lastOffset = ((long) docs[size - 1]) << 3;
+                slice.prefetch(firstOffset, lastOffset - firstOffset + 8);
+              }
+              for (int i = 0; i < size; i++) {
+                values[i] = slice.readLong(((long) docs[i]) << 3);
+              }
             }
           };
         default:
@@ -461,9 +539,35 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             @Override
             public void longValues(int size, int[] docs, long[] values, long defaultValue)
                 throws IOException {
-              // Delegate to help performance: when the super call inlines, calls to
-              // #advanceExact/#longValue become monomorphic.
-              super.longValues(size, docs, values, defaultValue);
+              if (size == 0) return;
+              // Prefetch DISI jump table + data blocks for the batch
+              prefetchDISI(disi, size, docs);
+              // Traverse DISI to find which docs exist and their indices
+              int[] indices = new int[size];
+              boolean[] exists = new boolean[size];
+              for (int i = 0; i < size; i++) {
+                exists[i] = disi.advanceExact(docs[i]);
+                if (exists[i]) {
+                  indices[i] = disi.index();
+                }
+              }
+              // Prefetch value data for existing docs
+              int firstExisting = -1, lastExisting = -1;
+              for (int i = 0; i < size; i++) {
+                if (exists[i]) {
+                  if (firstExisting == -1) firstExisting = i;
+                  lastExisting = i;
+                }
+              }
+              if (firstExisting >= 0) {
+                long firstOffset = indices[firstExisting];
+                long lastOffset = indices[lastExisting];
+                slice.prefetch(firstOffset, lastOffset - firstOffset + 1);
+              }
+              // Read values
+              for (int i = 0; i < size; i++) {
+                values[i] = exists[i] ? slice.readByte(indices[i]) : defaultValue;
+              }
             }
           };
         case 2:
@@ -472,6 +576,34 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             public long longValue() throws IOException {
               return slice.readShort(((long) disi.index()) << 1);
             }
+
+            @Override
+            public void longValues(int size, int[] docs, long[] values, long defaultValue)
+                throws IOException {
+              if (size == 0) return;
+              prefetchDISI(disi, size, docs);
+              int[] indices = new int[size];
+              boolean[] exists = new boolean[size];
+              for (int i = 0; i < size; i++) {
+                exists[i] = disi.advanceExact(docs[i]);
+                if (exists[i]) indices[i] = disi.index();
+              }
+              int firstExisting = -1, lastExisting = -1;
+              for (int i = 0; i < size; i++) {
+                if (exists[i]) {
+                  if (firstExisting == -1) firstExisting = i;
+                  lastExisting = i;
+                }
+              }
+              if (firstExisting >= 0) {
+                long firstOffset = ((long) indices[firstExisting]) << 1;
+                long lastOffset = ((long) indices[lastExisting]) << 1;
+                slice.prefetch(firstOffset, lastOffset - firstOffset + 2);
+              }
+              for (int i = 0; i < size; i++) {
+                values[i] = exists[i] ? slice.readShort(((long) indices[i]) << 1) : defaultValue;
+              }
+            }
           };
         case 4:
           return new SparseNormsIterator(disi) {
@@ -479,12 +611,68 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             public long longValue() throws IOException {
               return slice.readInt(((long) disi.index()) << 2);
             }
+
+            @Override
+            public void longValues(int size, int[] docs, long[] values, long defaultValue)
+                throws IOException {
+              if (size == 0) return;
+              prefetchDISI(disi, size, docs);
+              int[] indices = new int[size];
+              boolean[] exists = new boolean[size];
+              for (int i = 0; i < size; i++) {
+                exists[i] = disi.advanceExact(docs[i]);
+                if (exists[i]) indices[i] = disi.index();
+              }
+              int firstExisting = -1, lastExisting = -1;
+              for (int i = 0; i < size; i++) {
+                if (exists[i]) {
+                  if (firstExisting == -1) firstExisting = i;
+                  lastExisting = i;
+                }
+              }
+              if (firstExisting >= 0) {
+                long firstOffset = ((long) indices[firstExisting]) << 2;
+                long lastOffset = ((long) indices[lastExisting]) << 2;
+                slice.prefetch(firstOffset, lastOffset - firstOffset + 4);
+              }
+              for (int i = 0; i < size; i++) {
+                values[i] = exists[i] ? slice.readInt(((long) indices[i]) << 2) : defaultValue;
+              }
+            }
           };
         case 8:
           return new SparseNormsIterator(disi) {
             @Override
             public long longValue() throws IOException {
               return slice.readLong(((long) disi.index()) << 3);
+            }
+
+            @Override
+            public void longValues(int size, int[] docs, long[] values, long defaultValue)
+                throws IOException {
+              if (size == 0) return;
+              prefetchDISI(disi, size, docs);
+              int[] indices = new int[size];
+              boolean[] exists = new boolean[size];
+              for (int i = 0; i < size; i++) {
+                exists[i] = disi.advanceExact(docs[i]);
+                if (exists[i]) indices[i] = disi.index();
+              }
+              int firstExisting = -1, lastExisting = -1;
+              for (int i = 0; i < size; i++) {
+                if (exists[i]) {
+                  if (firstExisting == -1) firstExisting = i;
+                  lastExisting = i;
+                }
+              }
+              if (firstExisting >= 0) {
+                long firstOffset = ((long) indices[firstExisting]) << 3;
+                long lastOffset = ((long) indices[lastExisting]) << 3;
+                slice.prefetch(firstOffset, lastOffset - firstOffset + 8);
+              }
+              for (int i = 0; i < size; i++) {
+                values[i] = exists[i] ? slice.readLong(((long) indices[i]) << 3) : defaultValue;
+              }
             }
           };
         default:

@@ -761,6 +761,13 @@ public final class Lucene104PostingsReader extends PostingsReaderBase {
             }
           }
         }
+        // Prefetch the next block's data while we decode the current block.
+        // level0DocEndFP is where the current block's data ends and the next block starts.
+        // This is non-speculative: if docCountLeft > BLOCK_SIZE, we know the next block
+        // will be read when the current block is exhausted.
+        if (docCountLeft > BLOCK_SIZE) {
+          docIn.prefetch(level0DocEndFP, 1);
+        }
         refillFullBlock();
       } else {
         level0LastDocID = NO_MORE_DOCS;
@@ -781,7 +788,16 @@ public final class Lucene104PostingsReader extends PostingsReaderBase {
         long level0NumBytes = docIn.readVLong();
         long level0End = docIn.getFilePointer() + level0NumBytes;
         level0LastDocID += readVInt15(docIn);
+        // Read blockLength (= skip metadata size + block data size) to compute
+        // where the block data ends, needed for prefetching the next block.
+        long blockLength = readVLong15(docIn);
+        level0DocEndFP = docIn.getFilePointer() + blockLength;
         docIn.seek(level0End);
+        // Prefetch the next block while we decode the current one.
+        // level0DocEndFP is the end of the current block data; the next block starts there.
+        if (docCountLeft > BLOCK_SIZE) {
+          docIn.prefetch(level0DocEndFP, 1);
+        }
         refillFullBlock();
       } else {
         doMoveToNextLevel0Block();
