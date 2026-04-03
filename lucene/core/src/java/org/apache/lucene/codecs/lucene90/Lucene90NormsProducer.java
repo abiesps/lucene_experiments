@@ -30,6 +30,7 @@ import org.apache.lucene.index.IndexFileNames;
 import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.internal.hppc.IntObjectHashMap;
+import org.apache.lucene.search.PrefetchConfig;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IndexInput;
@@ -435,6 +436,7 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             @Override
             public void longValues(int size, int[] docs, long[] values, long defaultValue)
                 throws IOException {
+              if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
               if (size > 0) {
                 // Prefetch the byte range covering all docs in the batch
                 long firstOffset = docs[0];
@@ -456,6 +458,7 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             @Override
             public void longValues(int size, int[] docs, long[] values, long defaultValue)
                 throws IOException {
+              if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
               if (size > 0) {
                 long firstOffset = ((long) docs[0]) << 1;
                 long lastOffset = ((long) docs[size - 1]) << 1;
@@ -476,6 +479,7 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             @Override
             public void longValues(int size, int[] docs, long[] values, long defaultValue)
                 throws IOException {
+              if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
               if (size > 0) {
                 long firstOffset = ((long) docs[0]) << 2;
                 long lastOffset = ((long) docs[size - 1]) << 2;
@@ -496,6 +500,7 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             @Override
             public void longValues(int size, int[] docs, long[] values, long defaultValue)
                 throws IOException {
+              if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
               if (size > 0) {
                 long firstOffset = ((long) docs[0]) << 3;
                 long lastOffset = ((long) docs[size - 1]) << 3;
@@ -542,6 +547,7 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             @Override
             public void longValues(int size, int[] docs, long[] values, long defaultValue)
                 throws IOException {
+              if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
               if (size == 0) return;
               // Prefetch DISI jump table + data blocks for the batch
               prefetchDISI(disi, size, docs);
@@ -583,6 +589,7 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             @Override
             public void longValues(int size, int[] docs, long[] values, long defaultValue)
                 throws IOException {
+              if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
               if (size == 0) return;
               prefetchDISI(disi, size, docs);
               int[] indices = new int[size];
@@ -618,6 +625,7 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             @Override
             public void longValues(int size, int[] docs, long[] values, long defaultValue)
                 throws IOException {
+              if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
               if (size == 0) return;
               prefetchDISI(disi, size, docs);
               int[] indices = new int[size];
@@ -653,6 +661,7 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
             @Override
             public void longValues(int size, int[] docs, long[] values, long defaultValue)
                 throws IOException {
+              if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
               if (size == 0) return;
               prefetchDISI(disi, size, docs);
               int[] indices = new int[size];

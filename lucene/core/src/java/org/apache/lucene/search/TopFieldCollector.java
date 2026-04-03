@@ -339,7 +339,7 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
 
             @Override
             public void collect(DocIdStream stream) throws IOException {
-              if (bulkValueComparator == null) {
+              if (bulkValueComparator == null || !PrefetchConfig.isEnabled()) {
                 super.collect(stream); // default per-doc fallback
                 return;
               }
@@ -446,7 +446,7 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
 
             @Override
             public void collect(DocIdStream stream) throws IOException {
-              if (bulkValueComparator == null) {
+              if (bulkValueComparator == null || !PrefetchConfig.isEnabled()) {
                 super.collect(stream); // default per-doc fallback
                 return;
               }

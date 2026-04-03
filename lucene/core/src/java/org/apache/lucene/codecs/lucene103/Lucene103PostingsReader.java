@@ -47,6 +47,7 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.internal.vectorization.PostingDecodingUtil;
 import org.apache.lucene.internal.vectorization.VectorizationProvider;
 import org.apache.lucene.search.DocAndFloatFeatureBuffer;
+import org.apache.lucene.search.PrefetchConfig;
 import org.apache.lucene.store.ByteArrayDataInput;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.DataInput;
@@ -777,7 +778,7 @@ public final class Lucene103PostingsReader extends PostingsReaderBase {
         // level0DocEndFP is where the current block's data ends and the next block starts.
         // This is non-speculative: if docCountLeft > BLOCK_SIZE, we know the next block
         // will be read when the current block is exhausted.
-        if (docCountLeft > BLOCK_SIZE) {
+        if (PrefetchConfig.isEnabled() && docCountLeft > BLOCK_SIZE) {
           docIn.prefetch(level0DocEndFP, 1);
         }
         refillFullBlock();
@@ -807,7 +808,7 @@ public final class Lucene103PostingsReader extends PostingsReaderBase {
         docIn.seek(level0End);
         // Prefetch the next block while we decode the current one.
         // level0DocEndFP is the end of the current block data; the next block starts there.
-        if (docCountLeft > BLOCK_SIZE) {
+        if (PrefetchConfig.isEnabled() && docCountLeft > BLOCK_SIZE) {
           docIn.prefetch(level0DocEndFP, 1);
         }
         refillFullBlock();

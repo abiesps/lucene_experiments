@@ -44,6 +44,7 @@ import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.index.TermsEnum.SeekStatus;
 import org.apache.lucene.internal.hppc.IntObjectHashMap;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.PrefetchConfig;
 import org.apache.lucene.store.ByteArrayDataInput;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.DataInput;
@@ -759,6 +760,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     @Override
     public void longValues(int size, int[] docs, long[] values, long defaultValue)
         throws IOException {
+      if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
       if (size == 0) return;
 
       // Prefetch value byte ranges using shared helper (positions = doc IDs for dense fields)
@@ -799,6 +801,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     @Override
     public void longValues(int size, int[] docs, long[] values, long defaultValue)
         throws IOException {
+      if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
       if (size == 0) return;
 
       final int shift = vBPVReader.shift;
@@ -918,6 +921,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     @Override
     public void longValues(int size, int[] docs, long[] values, long defaultValue)
         throws IOException {
+      if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
       if (size == 0) return;
 
       // DISI prefetch (density-aware) — no value data prefetch needed for bpv=0
@@ -1015,6 +1019,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     @Override
     public void longValues(int size, int[] docs, long[] values, long defaultValue)
         throws IOException {
+      if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
       if (size == 0) return;
 
       int bpv = entry.bitsPerValue;
@@ -1108,6 +1113,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     @Override
     public void longValues(int size, int[] docs, long[] values, long defaultValue)
         throws IOException {
+      if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
       if (size == 0) return;
 
       // Step 1: Compute density ratio for strategy selection
@@ -1669,6 +1675,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           @Override
           public void ordValues(int size, int[] docs, int[] ords, int defaultOrd)
               throws IOException {
+            if (!PrefetchConfig.isEnabled()) { super.ordValues(size, docs, ords, defaultOrd); return; }
             if (size == 0) return;
             prefetchFixedBPV(size, docs, slice, ordsEntry.bitsPerValue);
             for (int i = 0; i < size; i++) {
@@ -1734,6 +1741,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           @Override
           public void ordValues(int size, int[] docs, int[] ords, int defaultOrd)
               throws IOException {
+            if (!PrefetchConfig.isEnabled()) { super.ordValues(size, docs, ords, defaultOrd); return; }
             if (size == 0) return;
 
             // Step 1: Compute density ratio for adaptive DISI prefetch strategy
@@ -1863,6 +1871,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       @Override
       public void ordValues(int size, int[] docs, int[] ords2, int defaultOrd)
           throws IOException {
+        if (!PrefetchConfig.isEnabled()) { super.ordValues(size, docs, ords2, defaultOrd); return; }
         ords.longValues(size, docs, longScratch, defaultOrd);
         for (int i = 0; i < size; i++) {
           ords2[i] = (int) longScratch[i];
@@ -1918,6 +1927,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
      * @param count number of ordinals in the array
      */
     public void prefetchOrdinals(int[] ords, int count) throws IOException {
+      if (!PrefetchConfig.isEnabled()) return;
       if (count == 0) return;
       TermsDict td = (TermsDict) termsEnum;
 
@@ -2018,6 +2028,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
      */
     @Override
     public void prefetchOrdinals(long[] ords, int count) throws IOException {
+      if (!PrefetchConfig.isEnabled()) return;
       if (count == 0) return;
       TermsDict td = (TermsDict) termsEnum;
 
@@ -2572,6 +2583,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           @Override
           public int ordValues(int size, int[] docs, long[] ordsOut, int[] counts)
               throws IOException {
+            if (!PrefetchConfig.isEnabled()) { return super.ordValues(size, docs, ordsOut, counts); }
             if (size == 0) return 0;
 
             // Phase 1: Prefetch address table entries for docs[0] to docs[size-1]+1.
@@ -2704,6 +2716,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           @Override
           public int ordValues(int size, int[] docs, long[] ordsOut, int[] counts)
               throws IOException {
+            if (!PrefetchConfig.isEnabled()) { return super.ordValues(size, docs, ordsOut, counts); }
             if (size == 0) return 0;
 
             // Step 1: DISI prefetch + traverse to collect DISI indices.
