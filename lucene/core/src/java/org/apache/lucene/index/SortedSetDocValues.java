@@ -147,6 +147,17 @@ public abstract class SortedSetDocValues extends DocValuesIterator {
   }
 
   /**
+   * Returns a {@link TermsEnum} optimized for sequential full scan with lookahead prefetch.
+   * Callers MUST iterate all terms via next() — do not use for random seeks.
+   * The default implementation delegates to {@link #termsEnum()}.
+   *
+   * @lucene.experimental
+   */
+  public TermsEnum sequentialTermsEnum() throws IOException {
+    return termsEnum();
+  }
+
+  /**
    * Returns a {@link TermsEnum} over the values, filtered by a {@link CompiledAutomaton} The enum
    * supports {@link TermsEnum#ord()}.
    */

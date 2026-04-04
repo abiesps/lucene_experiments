@@ -138,6 +138,13 @@ public final class FieldReader extends Terms {
 
   @Override
   public TermsEnum iterator() throws IOException {
+    // Prefetch the entire trie index for this field before loading it.
+    // The TrieReader constructor reads the entire trie recursively,
+    // so every block WILL be read. 100% non-speculative.
+    if (org.apache.lucene.search.PrefetchConfig.isEnabled()) {
+      IndexInput tipSlice = indexIn.slice("trie prefetch", indexStart, indexEnd - indexStart);
+      tipSlice.prefetch(0, indexEnd - indexStart);
+    }
     return new SegmentTermsEnum(this, newReader());
   }
 

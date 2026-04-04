@@ -171,6 +171,16 @@ final class SegmentTermsEnumFrame {
       // Already loaded
       return;
     }
+
+    // Sliding window prefetch: prefetch next 128KB ahead in the .tim file
+    // during sequential iteration. Non-speculative during full term scans
+    // (tryCollectFromTermFrequencies, OrdinalMap.build) because every block
+    // WILL be read.
+    if (org.apache.lucene.search.PrefetchConfig.isEnabled() && fp > ste.lastPrefetchedFP) {
+      long prefetchLength = 16L * 8192; // 16 cache blocks = 128KB
+      ste.in.prefetch(fp, prefetchLength);
+      ste.lastPrefetchedFP = fp + prefetchLength;
+    }
     // System.out.println("blc=" + blockLoadCount);
 
     ste.in.seek(fp);

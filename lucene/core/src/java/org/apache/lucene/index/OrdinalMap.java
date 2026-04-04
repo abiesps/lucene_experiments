@@ -130,7 +130,7 @@ public class OrdinalMap implements Accountable {
     final TermsEnum[] subs = new TermsEnum[values.length];
     final long[] weights = new long[values.length];
     for (int i = 0; i < values.length; ++i) {
-      subs[i] = values[i].termsEnum();
+      subs[i] = values[i].sequentialTermsEnum();
       weights[i] = values[i].getValueCount();
     }
     return build(owner, subs, weights, acceptableOverheadRatio);
@@ -148,7 +148,7 @@ public class OrdinalMap implements Accountable {
     final TermsEnum[] subs = new TermsEnum[values.length];
     final long[] weights = new long[values.length];
     for (int i = 0; i < values.length; ++i) {
-      subs[i] = values[i].termsEnum();
+      subs[i] = values[i].sequentialTermsEnum();
       weights[i] = values[i].getValueCount();
     }
     return build(owner, subs, weights, acceptableOverheadRatio);

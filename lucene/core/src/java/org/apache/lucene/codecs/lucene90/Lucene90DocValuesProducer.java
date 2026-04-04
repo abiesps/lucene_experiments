@@ -1919,6 +1919,13 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       return new TermsDict(entry.termsDictEntry, data);
     }
 
+    @Override
+    public TermsEnum sequentialTermsEnum() throws IOException {
+      TermsDict td = new TermsDict(entry.termsDictEntry, data);
+      td.setSequentialScan(true);
+      return td;
+    }
+
     /**
      * Prefetches term dictionary data for a set of ordinals so that subsequent lookupOrd calls find
      * the LZ4 blocks warm in the cache.
@@ -2019,6 +2026,13 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       return new TermsDict(entry.termsDictEntry, data);
     }
 
+    @Override
+    public TermsEnum sequentialTermsEnum() throws IOException {
+      TermsDict td = new TermsDict(entry.termsDictEntry, data);
+      td.setSequentialScan(true);
+      return td;
+    }
+
     /**
      * Prefetches term dictionary data for a set of ordinals so that subsequent lookupOrd calls find
      * the LZ4 blocks warm in the cache.
@@ -2095,6 +2109,19 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     long ord = -1;
     long currentCompressedBlockStart = -1;
     long currentCompressedBlockEnd = -1;
+
+    // Sliding window prefetch state: prefetch K LZ4 blocks ahead during sequential iteration
+    private static final int PREFETCH_LOOKAHEAD_BLOCKS = 16;
+    private long lastPrefetchedLZ4Block = -1;
+    private boolean sequentialScan = false;
+
+    /** Enable sliding window prefetch for sequential full scans (next() iteration). */
+    void setSequentialScan(boolean enabled) {
+      this.sequentialScan = enabled;
+      if (!enabled) {
+        lastPrefetchedLZ4Block = -1;
+      }
+    }
 
     TermsDict(TermsDictEntry entry, IndexInput data) throws IOException {
       this.entry = entry;
@@ -2272,6 +2299,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     }
 
     private void decompressBlock() throws IOException {
+      // Sliding window prefetch: only during sequential full scans
+      if (sequentialScan && PrefetchConfig.isEnabled()) {
+        maybePrefetchAhead();
+      }
+
       // The first term is kept uncompressed, so no need to decompress block if only
       // look up the first term when doing seek block.
       term.length = bytes.readVInt();
@@ -2295,6 +2327,44 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         // Reset the buffer.
         blockInput.reset(blockBuffer.bytes, blockBuffer.offset, blockBuffer.length);
       }
+    }
+
+    /**
+     * Prefetch the next K LZ4 term dictionary blocks ahead of the current position.
+     * Called during sequential iteration (next(), OrdinalMap.build, tryCollectFromTermFrequencies).
+     * Non-speculative: during a full scan, every block WILL be read.
+     */
+    private void maybePrefetchAhead() throws IOException {
+      long currentLZ4Block = ord >> TERMS_DICT_BLOCK_LZ4_SHIFT;
+      if (currentLZ4Block <= lastPrefetchedLZ4Block) {
+        return; // already prefetched ahead of current position
+      }
+
+      long totalLZ4Blocks =
+          (entry.termsDictSize + (1L << TERMS_DICT_BLOCK_LZ4_SHIFT) - 1)
+              >>> TERMS_DICT_BLOCK_LZ4_SHIFT;
+
+      long startBlock = currentLZ4Block + 1;
+      long endBlock = Math.min(startBlock + PREFETCH_LOOKAHEAD_BLOCKS, totalLZ4Blocks);
+
+      if (endBlock <= startBlock) {
+        return; // no more blocks to prefetch
+      }
+
+      // Get the byte range for blocks [startBlock, endBlock)
+      long startAddress = blockAddresses.get(startBlock);
+      long endAddress;
+      if (endBlock < totalLZ4Blocks) {
+        endAddress = blockAddresses.get(endBlock);
+      } else {
+        endAddress = entry.termsDataLength;
+      }
+
+      if (endAddress > startAddress) {
+        bytes.prefetch(startAddress, endAddress - startAddress);
+      }
+
+      lastPrefetchedLZ4Block = endBlock - 1;
     }
 
     @Override

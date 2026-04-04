@@ -57,6 +57,9 @@ final class SegmentTermsEnum extends BaseTermsEnum {
   private final TrieReader trieReader;
   private TrieReader.Node[] nodes = new TrieReader.Node[1];
 
+  // Sliding window prefetch: tracks the furthest file position we've prefetched to
+  long lastPrefetchedFP = -1;
+
   public SegmentTermsEnum(FieldReader fr, TrieReader reader) throws IOException {
     this.fr = fr;
     // Used to hold seek by TermState, or cached seek
