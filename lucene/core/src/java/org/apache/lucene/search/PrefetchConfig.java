@@ -28,11 +28,15 @@ package org.apache.lucene.search;
  */
 public final class PrefetchConfig {
 
-  /** Whether bulk prefetch is enabled. Default is false. */
-  private static volatile boolean enabled = false;
+  /** Whether bulk prefetch is enabled. Reads from system property at startup, default true. */
+  private static volatile boolean enabled = !"false".equalsIgnoreCase(
+      System.getProperty("lucene.prefetch.enabled",
+          System.getenv().getOrDefault("LUCENE_PREFETCH_ENABLED", "true")));
 
-  /** Batch size for bulk doc values prefetch in aggregators. Default is 4096. */
-  private static volatile int batchSize = 4096;
+  /** Batch size for bulk doc values prefetch in aggregators. Default 4096. */
+  private static volatile int batchSize = Integer.parseInt(
+      System.getProperty("lucene.prefetch.batchSize",
+          System.getenv().getOrDefault("LUCENE_PREFETCH_BATCH_SIZE", "4096")));
 
   private PrefetchConfig() {}
 
