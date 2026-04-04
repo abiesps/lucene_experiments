@@ -139,6 +139,23 @@ public abstract class SortedSetDocValues extends DocValuesIterator {
   }
 
   /**
+   * Prefetches the term dictionary block for the given ordinal so that a subsequent
+   * {@link #lookupOrd(long)} call finds the data warm in the cache.
+   *
+   * <p>This is the ordinal-based equivalent of {@link TermsEnum#prepareSeekExact(BytesRef)}:
+   * phase 1 issues async IO for the target block, phase 2 ({@link #lookupOrd(long)})
+   * reads the data without blocking on IO.
+   *
+   * <p>The default implementation is a no-op. Subclasses backed by compressed term dictionaries
+   * (e.g., LZ4-compressed blocks) may override this.
+   *
+   * @param ord the ordinal to prefetch
+   */
+  public void prepareLookupOrd(long ord) throws IOException {
+    // no-op by default
+  }
+
+  /**
    * Returns a {@link TermsEnum} over the values. The enum supports {@link TermsEnum#ord()} and
    * {@link TermsEnum#seekExact(long)}.
    */

@@ -119,6 +119,23 @@ public abstract class SortedDocValues extends DocValuesIterator {
   }
 
   /**
+   * Prefetches the term dictionary block for the given ordinal so that a subsequent
+   * {@link #lookupOrd(int)} call finds the data warm in the cache.
+   *
+   * <p>This is the ordinal-based equivalent of {@link TermsEnum#prepareSeekExact(BytesRef)}:
+   * phase 1 issues async IO for the target block, phase 2 ({@link #lookupOrd(int)})
+   * reads the data without blocking on IO.
+   *
+   * <p>The default implementation is a no-op. Subclasses backed by compressed term dictionaries
+   * (e.g., LZ4-compressed blocks) may override this.
+   *
+   * @param ord the ordinal to prefetch
+   */
+  public void prepareLookupOrd(int ord) throws IOException {
+    // no-op by default
+  }
+
+  /**
    * Returns a {@link TermsEnum} optimized for sequential full scan with lookahead prefetch.
    * Callers MUST iterate all terms via next() — do not use for random seeks.
    * The default implementation delegates to {@link #termsEnum()}.

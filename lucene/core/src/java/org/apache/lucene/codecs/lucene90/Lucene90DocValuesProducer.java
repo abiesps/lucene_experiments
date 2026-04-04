@@ -1983,6 +1983,13 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         }
       }
     }
+
+    @Override
+    public void prepareLookupOrd(int ord) throws IOException {
+      if (!PrefetchConfig.isEnabled()) return;
+      TermsDict td = (TermsDict) termsEnum;
+      td.prepareSeekExact(ord);
+    }
   }
 
   private abstract class BaseSortedSetDocValues extends SortedSetDocValues {
@@ -2091,6 +2098,13 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         }
       }
     }
+
+    @Override
+    public void prepareLookupOrd(long ord) throws IOException {
+      if (!PrefetchConfig.isEnabled()) return;
+      TermsDict td = (TermsDict) termsEnum;
+      td.prepareSeekExact(ord);
+    }
   }
 
   private class TermsDict extends BaseTermsEnum {
@@ -2178,17 +2192,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         throw new IndexOutOfBoundsException();
       }
 
-      // Detect sequential access pattern: if caller seeks to ord+1 repeatedly,
-      // enable sliding window prefetch because this is a full scan
-      if (PrefetchConfig.isEnabled() && ord == this.ord + 1) {
-        if (!sequentialScan) {
-          sequentialScan = true;
-        }
-      } else {
-        sequentialScan = false;
-        lastPrefetchedLZ4Block = -1;
-      }
-
       // Signed shift since ord is -1 when the terms enum is not positioned
       final long currentBlockIndex = this.ord >> TERMS_DICT_BLOCK_LZ4_SHIFT;
       final long blockIndex = ord >> TERMS_DICT_BLOCK_LZ4_SHIFT;
@@ -2201,6 +2204,42 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       // Scan to the looked up ord
       while (this.ord < ord) {
         next();
+      }
+    }
+
+    /**
+     * Prefetches the LZ4 term dictionary block that contains the given ordinal.
+     * This is the ordinal-based equivalent of {@link TermsEnum#prepareSeekExact(BytesRef)}:
+     * phase 1 issues async IO for the target block, phase 2 ({@link #seekExact(long)})
+     * finds the data warm in the cache.
+     *
+     * <p>Non-speculative: the caller MUST subsequently call {@link #seekExact(long)} with
+     * the same ordinal. Calling this without a following seekExact wastes IO.
+     *
+     * @param ord the ordinal whose LZ4 block should be prefetched
+     */
+    void prepareSeekExact(long ord) throws IOException {
+      if (ord < 0 || ord >= entry.termsDictSize) {
+        return;
+      }
+      long blockIndex = ord >> TERMS_DICT_BLOCK_LZ4_SHIFT;
+      // Skip if we're already positioned in this block (data is already decompressed)
+      long currentBlockIndex = this.ord >> TERMS_DICT_BLOCK_LZ4_SHIFT;
+      if (this.ord >= 0 && blockIndex == currentBlockIndex) {
+        return;
+      }
+      long blockAddress = blockAddresses.get(blockIndex);
+      long nextBlockAddress;
+      long totalBlocks =
+          (entry.termsDictSize + (1L << TERMS_DICT_BLOCK_LZ4_SHIFT) - 1)
+              >>> TERMS_DICT_BLOCK_LZ4_SHIFT;
+      if (blockIndex + 1 < totalBlocks) {
+        nextBlockAddress = blockAddresses.get(blockIndex + 1);
+      } else {
+        nextBlockAddress = entry.termsDataLength;
+      }
+      if (nextBlockAddress > blockAddress) {
+        bytes.prefetch(blockAddress, nextBlockAddress - blockAddress);
       }
     }
 

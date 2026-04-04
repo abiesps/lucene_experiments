@@ -67,6 +67,7 @@ class SortedSetDocValuesTermsEnum extends BaseTermsEnum {
   public void seekExact(long ord) throws IOException {
     assert ord >= 0 && ord < values.getValueCount();
     currentOrd = (int) ord;
+    values.prepareLookupOrd(currentOrd);
     scratch.copyBytes(values.lookupOrd(currentOrd));
   }
 
@@ -75,6 +76,14 @@ class SortedSetDocValuesTermsEnum extends BaseTermsEnum {
     currentOrd++;
     if (currentOrd >= values.getValueCount()) {
       return null;
+    }
+    // Prefetch the LZ4 block for the NEXT ordinal (currentOrd + 1) while we read the current one.
+    // This is the ordinal-based equivalent of TermsEnum.prepareSeekExact(BytesRef):
+    // phase 1 (prepareLookupOrd) issues async IO for the next block, phase 2 (lookupOrd)
+    // reads the current block. By the time we call lookupOrd(currentOrd + 1) in the next
+    // iteration, the data should already be warm in the cache.
+    if (currentOrd + 1 < values.getValueCount()) {
+      values.prepareLookupOrd(currentOrd + 1);
     }
     scratch.copyBytes(values.lookupOrd(currentOrd));
     return scratch.get();
