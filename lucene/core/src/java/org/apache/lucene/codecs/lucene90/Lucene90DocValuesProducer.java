@@ -2177,6 +2177,18 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       if (ord < 0 || ord >= entry.termsDictSize) {
         throw new IndexOutOfBoundsException();
       }
+
+      // Detect sequential access pattern: if caller seeks to ord+1 repeatedly,
+      // enable sliding window prefetch because this is a full scan
+      if (PrefetchConfig.isEnabled() && ord == this.ord + 1) {
+        if (!sequentialScan) {
+          sequentialScan = true;
+        }
+      } else {
+        sequentialScan = false;
+        lastPrefetchedLZ4Block = -1;
+      }
+
       // Signed shift since ord is -1 when the terms enum is not positioned
       final long currentBlockIndex = this.ord >> TERMS_DICT_BLOCK_LZ4_SHIFT;
       final long blockIndex = ord >> TERMS_DICT_BLOCK_LZ4_SHIFT;
