@@ -31,6 +31,9 @@ public final class PrefetchConfig {
   /** Whether bulk prefetch is enabled. Default is false. */
   private static volatile boolean enabled = false;
 
+  /** Batch size for bulk doc values prefetch in aggregators. Default is 4096. */
+  private static volatile int batchSize = 4096;
+
   private PrefetchConfig() {}
 
   /** Returns true if bulk prefetch is enabled. */
@@ -41,5 +44,15 @@ public final class PrefetchConfig {
   /** Set whether bulk prefetch is enabled. Thread-safe. */
   public static void setEnabled(boolean value) {
     enabled = value;
+  }
+
+  /** Returns the batch size for bulk doc values prefetch. */
+  public static int getBatchSize() {
+    return batchSize;
+  }
+
+  /** Set the batch size for bulk doc values prefetch. Thread-safe. */
+  public static void setBatchSize(int value) {
+    batchSize = value;
   }
 }
