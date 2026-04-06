@@ -764,7 +764,21 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       if (size == 0) return;
 
       // Prefetch value byte ranges using shared helper (positions = doc IDs for dense fields)
-      prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
+      if (entry.bitsPerValue > 0) {
+        // Debug logging: log prefetch range for sort validation
+        if (PrefetchConfig.isDebugEnabled()) {
+          int readSize = entry.bitsPerValue <= 8 ? 1 : entry.bitsPerValue <= 16 ? 2 : entry.bitsPerValue <= 32 ? 4 : 8;
+          long firstByte = ((long) docs[0] * entry.bitsPerValue) / 8;
+          long lastByte = ((long) docs[size - 1] * entry.bitsPerValue) / 8 + readSize;
+          System.err.println("[PREFETCH-SORT] bpv=" + entry.bitsPerValue
+              + " size=" + size
+              + " docs[0]=" + docs[0] + " docs[last]=" + docs[size - 1]
+              + " prefetchRange=[" + firstByte + "," + lastByte + ")"
+              + " bytes=" + (lastByte - firstByte)
+              + " cacheBlocks=[" + (firstByte / 8192) + "," + (lastByte / 8192) + "]");
+        }
+        prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
+      }
 
       // Read values with appropriate decode
       for (int i = 0; i < size; i++) {

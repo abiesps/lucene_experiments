@@ -42,13 +42,28 @@ public final class PrefetchConfig {
 
   private static volatile boolean logged = false;
 
+  /** Whether debug logging for prefetch is enabled. */
+  private static volatile boolean debugEnabled = "true".equalsIgnoreCase(
+      System.getProperty("lucene.prefetch.debug",
+          System.getenv().getOrDefault("LUCENE_PREFETCH_DEBUG", "false")));
+
   /** Returns true if bulk prefetch is enabled. */
   public static boolean isEnabled() {
     if (!logged) {
       logged = true;
-      System.err.println("[PrefetchConfig] isEnabled()=" + enabled + " batchSize=" + batchSize);
+      System.err.println("[PrefetchConfig] isEnabled()=" + enabled + " batchSize=" + batchSize + " debug=" + debugEnabled);
     }
     return enabled;
+  }
+
+  /** Returns true if prefetch debug logging is enabled. */
+  public static boolean isDebugEnabled() {
+    return debugEnabled;
+  }
+
+  /** Set whether prefetch debug logging is enabled. Thread-safe. */
+  public static void setDebugEnabled(boolean value) {
+    debugEnabled = value;
   }
 
   /** Set whether bulk prefetch is enabled. Thread-safe. */
