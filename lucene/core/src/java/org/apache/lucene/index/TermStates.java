@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.TaskExecutor;
@@ -37,6 +38,15 @@ import org.apache.lucene.util.IOSupplier;
  * @lucene.experimental
  */
 public final class TermStates {
+
+  // Query-level timing: tracks the nanoTime of the first build() call per query
+  // so all subsequent logs show relative offset in ms from query start
+  private static final ThreadLocal<long[]> QUERY_START = ThreadLocal.withInitial(() -> new long[]{0L});
+  private static final AtomicLong QUERY_COUNTER = new AtomicLong(0);
+
+  private static String ts() {
+    return "epochMs=" + System.currentTimeMillis() + " relNanos=" + System.nanoTime();
+  }
 
   private static final TermState EMPTY_TERMSTATE =
       new TermState() {
@@ -105,63 +115,83 @@ public final class TermStates {
     IndexReaderContext context = indexSearcher.getTopReaderContext();
     assert context != null;
     final TermStates perReaderTermState = new TermStates(needsStats ? null : term, context);
-    if (needsStats) {
-      long buildStart = System.nanoTime();
-      TaskExecutor taskExecutor = indexSearcher.getTaskExecutor();
-      List<LeafReaderContext> leaves = context.leaves();
+    System.err.println("[TERM-BUILD] term=" + term.text()
+        + " needsStats=" + needsStats
+        + " segments=" + context.leaves().size()
+        + " thread=" + Thread.currentThread().getName()
+        + " " + ts());
 
-      // Build one task per segment: each task does the full term lookup (trie walk + block read)
-      // independently. No sequential IO across segments.
-      List<Callable<TermLookupResult>> tasks = new ArrayList<>(leaves.size());
-      for (LeafReaderContext ctx : leaves) {
-        final int ord = ctx.ord;
-        tasks.add(() -> {
-          long segStart = System.nanoTime();
-          Terms terms = Terms.getTerms(ctx.reader(), term.field());
-          TermsEnum termsEnum = terms.iterator();
-          long iteratorTime = System.nanoTime();
-          // prepareSeekExact does trie walk (IO) + prefetchBlock (async IO)
-          IOBooleanSupplier termExistsSupplier = termsEnum.prepareSeekExact(term.bytes());
-          long prepareTime = System.nanoTime();
-          boolean found = termExistsSupplier != null && termExistsSupplier.get();
-          long getTime = System.nanoTime();
-          long totalUs = (getTime - segStart) / 1000;
-          long iterUs = (iteratorTime - segStart) / 1000;
-          long prepUs = (prepareTime - iteratorTime) / 1000;
-          long readUs = (getTime - prepareTime) / 1000;
+    // Always do concurrent term lookup across all segments, regardless of needsStats.
+    // When needsStats=true: we accumulate docFreq/totalTermFreq stats.
+    // When needsStats=false: we still pre-populate states[] so get() returns cached results
+    // instead of doing sequential IO per segment.
+    long buildStart = System.nanoTime();
+    TaskExecutor taskExecutor = indexSearcher.getTaskExecutor();
+    List<LeafReaderContext> leaves = context.leaves();
+
+    List<Callable<TermLookupResult>> tasks = new ArrayList<>(leaves.size());
+    for (LeafReaderContext ctx : leaves) {
+      final int ord = ctx.ord;
+      tasks.add(() -> {
+        long segStart = System.nanoTime();
+        Terms terms = ctx.reader().terms(term.field());
+        if (terms == null) {
           System.err.println("[TERM-LOOKUP] seg=" + ord
               + " term=" + term.text()
-              + " found=" + found
-              + " totalUs=" + totalUs
-              + " iteratorUs=" + iterUs
-              + " prepareSeekUs=" + prepUs
-              + " supplierGetUs=" + readUs
-              + " thread=" + Thread.currentThread().getName());
-          if (found) {
-            return new TermLookupResult(
-                ord, termsEnum.termState(), termsEnum.docFreq(), termsEnum.totalTermFreq());
-          }
-          return null;
-        });
-      }
-
-      // Execute all segment lookups concurrently and collect results
-      List<TermLookupResult> results = taskExecutor.invokeAll(tasks);
-      long invokeAllDone = System.nanoTime();
-      int foundCount = 0;
-      for (TermLookupResult result : results) {
-        if (result != null) {
-          foundCount++;
-          perReaderTermState.register(
-              result.state(), result.ord(), result.docFreq(), result.totalTermFreq());
+              + " found=no_field totalUs=0"
+              + " thread=" + Thread.currentThread().getName()
+              + " " + ts());
+          return new TermLookupResult(ord, null, 0, 0);
         }
-      }
-      long totalMs = (invokeAllDone - buildStart) / 1_000_000;
-      System.err.println("[TERM-STATES] term=" + term.text()
-          + " segments=" + leaves.size()
-          + " found=" + foundCount
-          + " totalMs=" + totalMs);
+        TermsEnum termsEnum = terms.iterator();
+        long iteratorTime = System.nanoTime();
+        IOBooleanSupplier termExistsSupplier = termsEnum.prepareSeekExact(term.bytes());
+        long prepareTime = System.nanoTime();
+        boolean found = termExistsSupplier != null && termExistsSupplier.get();
+        long getTime = System.nanoTime();
+        long totalUs = (getTime - segStart) / 1000;
+        long iterUs = (iteratorTime - segStart) / 1000;
+        long prepUs = (prepareTime - iteratorTime) / 1000;
+        long readUs = (getTime - prepareTime) / 1000;
+        System.err.println("[TERM-LOOKUP] seg=" + ord
+            + " term=" + term.text()
+            + " found=" + found
+            + " totalUs=" + totalUs
+            + " iteratorUs=" + iterUs
+            + " prepareSeekUs=" + prepUs
+            + " supplierGetUs=" + readUs
+            + " thread=" + Thread.currentThread().getName()
+            + " " + ts());
+        if (found) {
+          return new TermLookupResult(
+              ord, termsEnum.termState(), termsEnum.docFreq(), termsEnum.totalTermFreq());
+        }
+        // Return null state to signal term not found in this segment
+        return new TermLookupResult(ord, null, 0, 0);
+      });
     }
+
+    List<TermLookupResult> results = taskExecutor.invokeAll(tasks);
+    long invokeAllDone = System.nanoTime();
+    int foundCount = 0;
+    for (TermLookupResult result : results) {
+      if (result.state() != null) {
+        foundCount++;
+        perReaderTermState.register(result.state(), result.ord());
+        if (needsStats) {
+          perReaderTermState.accumulateStatistics(result.docFreq(), result.totalTermFreq());
+        }
+      } else {
+        // Mark segment as checked but term not found, so get() won't redo IO
+        perReaderTermState.states[result.ord()] = EMPTY_TERMSTATE;
+      }
+    }
+    long totalMs = (invokeAllDone - buildStart) / 1_000_000;
+    System.err.println("[TERM-STATES] term=" + term.text()
+        + " needsStats=" + needsStats
+        + " segments=" + leaves.size()
+        + " found=" + foundCount
+        + " totalMs=" + totalMs);
     return perReaderTermState;
   }
 
@@ -190,7 +220,8 @@ public final class TermStates {
   public void register(TermState state, final int ord) {
     assert state != null : "state must not be null";
     assert ord >= 0 && ord < states.length;
-    assert states[ord] == null : "state for ord: " + ord + " already registered";
+    assert states[ord] == null || states[ord] == EMPTY_TERMSTATE
+        : "state for ord: " + ord + " already registered";
     states[ord] = state;
   }
 
@@ -218,26 +249,53 @@ public final class TermStates {
   public IOSupplier<TermState> get(LeafReaderContext ctx) throws IOException {
     assert ctx.ord >= 0 && ctx.ord < states.length;
     if (term == null) {
+      // needsStats=true path: build() already populated states[] concurrently
       if (states[ctx.ord] == null) {
+        System.err.println("[TERM-GET] seg=" + ctx.ord
+            + " path=needsStats-null thread=" + Thread.currentThread().getName()
+            + " " + ts());
         return null;
       } else {
+        System.err.println("[TERM-GET] seg=" + ctx.ord
+            + " path=needsStats-cached thread=" + Thread.currentThread().getName()
+            + " " + ts());
         return () -> states[ctx.ord];
       }
     }
+    // needsStats=false path: get() does the actual IO (prepareSeekExact)
     if (this.states[ctx.ord] == null) {
+      long getStart = System.nanoTime();
       final Terms terms = ctx.reader().terms(term.field());
       if (terms == null) {
         this.states[ctx.ord] = EMPTY_TERMSTATE;
+        System.err.println("[TERM-GET] seg=" + ctx.ord
+            + " term=" + term.text()
+            + " path=noStats-noTerms thread=" + Thread.currentThread().getName()
+            + " " + ts());
         return null;
       }
       final TermsEnum termsEnum = terms.iterator();
+      long iterTime = System.nanoTime();
       IOBooleanSupplier termExistsSupplier = termsEnum.prepareSeekExact(term.bytes());
+      long prepareTime = System.nanoTime();
+      long prepUs = (prepareTime - iterTime) / 1000;
       if (termExistsSupplier == null) {
         this.states[ctx.ord] = EMPTY_TERMSTATE;
+        System.err.println("[TERM-GET] seg=" + ctx.ord
+            + " term=" + term.text()
+            + " path=noStats-notFound prepareSeekUs=" + prepUs
+            + " thread=" + Thread.currentThread().getName()
+            + " " + ts());
         return null;
       }
+      System.err.println("[TERM-GET] seg=" + ctx.ord
+          + " term=" + term.text()
+          + " path=noStats-IO prepareSeekUs=" + prepUs
+          + " thread=" + Thread.currentThread().getName()
+          + " " + ts());
       return () -> {
         if (this.states[ctx.ord] == null) {
+          long supplierStart = System.nanoTime();
           TermState state = null;
           if (termExistsSupplier.get()) {
             state = termsEnum.termState();
@@ -245,6 +303,13 @@ public final class TermStates {
           } else {
             this.states[ctx.ord] = EMPTY_TERMSTATE;
           }
+          long supplierEnd = System.nanoTime();
+          System.err.println("[TERM-GET-SUPPLIER] seg=" + ctx.ord
+              + " term=" + term.text()
+              + " found=" + (this.states[ctx.ord] != EMPTY_TERMSTATE)
+              + " supplierGetUs=" + ((supplierEnd - supplierStart) / 1000)
+              + " thread=" + Thread.currentThread().getName()
+              + " " + ts());
         }
         TermState state = this.states[ctx.ord];
         if (state == EMPTY_TERMSTATE) {
@@ -255,8 +320,14 @@ public final class TermStates {
     }
     TermState state = this.states[ctx.ord];
     if (state == EMPTY_TERMSTATE) {
+      System.err.println("[TERM-GET] seg=" + ctx.ord
+          + " path=already-empty thread=" + Thread.currentThread().getName()
+          + " " + ts());
       return null;
     }
+    System.err.println("[TERM-GET] seg=" + ctx.ord
+        + " path=already-cached thread=" + Thread.currentThread().getName()
+        + " " + ts());
     return () -> state;
   }
 
