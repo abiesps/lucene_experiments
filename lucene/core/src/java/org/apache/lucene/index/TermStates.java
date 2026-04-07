@@ -106,6 +106,7 @@ public final class TermStates {
     assert context != null;
     final TermStates perReaderTermState = new TermStates(needsStats ? null : term, context);
     if (needsStats) {
+      long buildStart = System.nanoTime();
       TaskExecutor taskExecutor = indexSearcher.getTaskExecutor();
       List<LeafReaderContext> leaves = context.leaves();
 
@@ -115,11 +116,28 @@ public final class TermStates {
       for (LeafReaderContext ctx : leaves) {
         final int ord = ctx.ord;
         tasks.add(() -> {
+          long segStart = System.nanoTime();
           Terms terms = Terms.getTerms(ctx.reader(), term.field());
           TermsEnum termsEnum = terms.iterator();
+          long iteratorTime = System.nanoTime();
           // prepareSeekExact does trie walk (IO) + prefetchBlock (async IO)
           IOBooleanSupplier termExistsSupplier = termsEnum.prepareSeekExact(term.bytes());
-          if (termExistsSupplier != null && termExistsSupplier.get()) {
+          long prepareTime = System.nanoTime();
+          boolean found = termExistsSupplier != null && termExistsSupplier.get();
+          long getTime = System.nanoTime();
+          long totalUs = (getTime - segStart) / 1000;
+          long iterUs = (iteratorTime - segStart) / 1000;
+          long prepUs = (prepareTime - iteratorTime) / 1000;
+          long readUs = (getTime - prepareTime) / 1000;
+          System.err.println("[TERM-LOOKUP] seg=" + ord
+              + " term=" + term.text()
+              + " found=" + found
+              + " totalUs=" + totalUs
+              + " iteratorUs=" + iterUs
+              + " prepareSeekUs=" + prepUs
+              + " supplierGetUs=" + readUs
+              + " thread=" + Thread.currentThread().getName());
+          if (found) {
             return new TermLookupResult(
                 ord, termsEnum.termState(), termsEnum.docFreq(), termsEnum.totalTermFreq());
           }
@@ -129,12 +147,20 @@ public final class TermStates {
 
       // Execute all segment lookups concurrently and collect results
       List<TermLookupResult> results = taskExecutor.invokeAll(tasks);
+      long invokeAllDone = System.nanoTime();
+      int foundCount = 0;
       for (TermLookupResult result : results) {
         if (result != null) {
+          foundCount++;
           perReaderTermState.register(
               result.state(), result.ord(), result.docFreq(), result.totalTermFreq());
         }
       }
+      long totalMs = (invokeAllDone - buildStart) / 1_000_000;
+      System.err.println("[TERM-STATES] term=" + term.text()
+          + " segments=" + leaves.size()
+          + " found=" + foundCount
+          + " totalMs=" + totalMs);
     }
     return perReaderTermState;
   }
