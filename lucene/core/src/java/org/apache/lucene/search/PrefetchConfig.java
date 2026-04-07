@@ -30,18 +30,15 @@ public final class PrefetchConfig {
 
   /** Whether bulk prefetch is enabled. Reads from system property at startup, default true. */
   private static volatile boolean enabled = !"false".equalsIgnoreCase(
-      System.getProperty("lucene.prefetch.enabled",
-          System.getenv().getOrDefault("LUCENE_PREFETCH_ENABLED", "true")));
+      System.getProperty("lucene.prefetch.enabled", "true"));
 
   /** Batch size for bulk doc values prefetch in aggregators. Default 4096. */
   private static volatile int batchSize = Integer.parseInt(
-      System.getProperty("lucene.prefetch.batchSize",
-          System.getenv().getOrDefault("LUCENE_PREFETCH_BATCH_SIZE", "4096")));
+      System.getProperty("lucene.prefetch.batchSize", "4096"));
 
   /** Cache block size in bytes for debug logging. Default 32768 (32KB). */
   private static volatile int cacheBlockSize = Integer.parseInt(
-      System.getProperty("lucene.prefetch.cacheBlockSize",
-          System.getenv().getOrDefault("LUCENE_PREFETCH_CACHE_BLOCK_SIZE", "32768")));
+      System.getProperty("lucene.prefetch.cacheBlockSize", "32768"));
 
   private PrefetchConfig() {}
 
@@ -49,8 +46,7 @@ public final class PrefetchConfig {
 
   /** Whether debug logging for prefetch is enabled. */
   private static volatile boolean debugEnabled = "true".equalsIgnoreCase(
-      System.getProperty("lucene.prefetch.debug",
-          System.getenv().getOrDefault("LUCENE_PREFETCH_DEBUG", "false")));
+      System.getProperty("lucene.prefetch.debug", "false"));
 
   /** Returns true if bulk prefetch is enabled. */
   public static boolean isEnabled() {
