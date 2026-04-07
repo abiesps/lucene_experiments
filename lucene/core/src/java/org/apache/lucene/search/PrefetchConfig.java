@@ -38,6 +38,11 @@ public final class PrefetchConfig {
       System.getProperty("lucene.prefetch.batchSize",
           System.getenv().getOrDefault("LUCENE_PREFETCH_BATCH_SIZE", "4096")));
 
+  /** Cache block size in bytes for debug logging. Default 32768 (32KB). */
+  private static volatile int cacheBlockSize = Integer.parseInt(
+      System.getProperty("lucene.prefetch.cacheBlockSize",
+          System.getenv().getOrDefault("LUCENE_PREFETCH_CACHE_BLOCK_SIZE", "32768")));
+
   private PrefetchConfig() {}
 
   private static volatile boolean logged = false;
@@ -79,5 +84,15 @@ public final class PrefetchConfig {
   /** Set the batch size for bulk doc values prefetch. Thread-safe. */
   public static void setBatchSize(int value) {
     batchSize = value;
+  }
+
+  /** Returns the cache block size in bytes (for debug logging). Default 32KB. */
+  public static int getCacheBlockSize() {
+    return cacheBlockSize;
+  }
+
+  /** Set the cache block size in bytes. Thread-safe. */
+  public static void setCacheBlockSize(int value) {
+    cacheBlockSize = value;
   }
 }
