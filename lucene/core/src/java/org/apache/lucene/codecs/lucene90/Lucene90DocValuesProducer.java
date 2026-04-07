@@ -1262,11 +1262,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       } else {
         final RandomAccessInput slice =
             data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
-        // Prefetch the first page of data. Following pages are expected to get prefetched through
-        // read-ahead.
-        if (slice.length() > 0) {
-          slice.prefetch(0, 1);
-        }
         if (entry.blockShift >= 0) {
           // dense but split into blocks of different bits per value
           return new DenseVaryingBPVDocValues(maxDoc, entry, slice);
@@ -1322,11 +1317,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       } else {
         final RandomAccessInput slice =
             data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
-        // Prefetch the first page of data. Following pages are expected to get prefetched through
-        // read-ahead.
-        if (slice.length() > 0) {
-          slice.prefetch(0, 1);
-        }
         if (entry.blockShift >= 0) {
           // sparse and split into blocks of different bits per value
           return new SparseVaryingBPVDocValues(entry, disi, slice);
@@ -1380,11 +1370,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     } else {
       final RandomAccessInput slice =
           data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
-      // Prefetch the first page of data. Following pages are expected to get prefetched through
-      // read-ahead.
-      if (slice.length() > 0) {
-        slice.prefetch(0, 1);
-      }
       if (entry.blockShift >= 0) {
         return new LongValues() {
           final VaryingBPVReader vBPVReader = new VaryingBPVReader(entry, slice);
@@ -1530,11 +1515,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     }
 
     final RandomAccessInput bytesSlice = data.randomAccessSlice(entry.dataOffset, entry.dataLength);
-    // Prefetch the first page of data. Following pages are expected to get prefetched through
-    // read-ahead.
-    if (bytesSlice.length() > 0) {
-      bytesSlice.prefetch(0, 1);
-    }
 
     if (entry.docsWithFieldOffset == -1) {
       // dense
@@ -1554,11 +1534,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         // variable length
         final RandomAccessInput addressesData =
             this.data.randomAccessSlice(entry.addressesOffset, entry.addressesLength);
-        // Prefetch the first page of data. Following pages are expected to get prefetched through
-        // read-ahead.
-        if (addressesData.length() > 0) {
-          addressesData.prefetch(0, 1);
-        }
         final LongValues addresses =
             DirectMonotonicReader.getInstance(entry.addressesMeta, addressesData, merging);
         return new DenseBinaryDocValues(maxDoc) {
@@ -1599,11 +1574,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         // variable length
         final RandomAccessInput addressesData =
             this.data.randomAccessSlice(entry.addressesOffset, entry.addressesLength);
-        // Prefetch the first page of data. Following pages are expected to get prefetched through
-        // read-ahead.
-        if (addressesData.length() > 0) {
-          addressesData.prefetch(0, 1);
-        }
         final LongValues addresses =
             DirectMonotonicReader.getInstance(entry.addressesMeta, addressesData);
         return new SparseBinaryDocValues(disi) {
@@ -1640,11 +1610,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
       final RandomAccessInput slice =
           data.randomAccessSlice(ordsEntry.valuesOffset, ordsEntry.valuesLength);
-      // Prefetch the first page of data. Following pages are expected to get prefetched through
-      // read-ahead.
-      if (slice.length() > 0) {
-        slice.prefetch(0, 1);
-      }
       final LongValues values =
           getDirectReaderInstance(slice, ordsEntry.bitsPerValue, 0L, ordsEntry.numValues);
 
@@ -2131,11 +2096,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
     final RandomAccessInput addressesInput =
         data.randomAccessSlice(entry.addressesOffset, entry.addressesLength);
-    // Prefetch the first page of data. Following pages are expected to get prefetched through
-    // read-ahead.
-    if (addressesInput.length() > 0) {
-      addressesInput.prefetch(0, 1);
-    }
     final LongValues addresses =
         DirectMonotonicReader.getInstance(entry.addressesMeta, addressesInput, merging);
 
@@ -2295,21 +2255,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
       final RandomAccessInput addressesInput =
           data.randomAccessSlice(ordsEntry.addressesOffset, ordsEntry.addressesLength);
-      // Prefetch the first page of data. Following pages are expected to get prefetched through
-      // read-ahead.
-      if (addressesInput.length() > 0) {
-        addressesInput.prefetch(0, 1);
-      }
       final LongValues addresses =
           DirectMonotonicReader.getInstance(ordsEntry.addressesMeta, addressesInput);
 
       final RandomAccessInput slice =
           data.randomAccessSlice(ordsEntry.valuesOffset, ordsEntry.valuesLength);
-      // Prefetch the first page of data. Following pages are expected to get prefetched through
-      // read-ahead.
-      if (slice.length() > 0) {
-        slice.prefetch(0, 1);
-      }
       final LongValues values = DirectReader.getInstance(slice, ordsEntry.bitsPerValue);
 
       if (ordsEntry.docsWithFieldOffset == -1) { // dense
@@ -2532,7 +2482,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       if (rankSlice != null && rankSlice.length() > 0) {
         // Prefetch the first page of data. Following pages are expected to get prefetched through
         // read-ahead.
-        rankSlice.prefetch(0, 1);
       }
       shift = entry.blockShift;
       mul = entry.gcd;
