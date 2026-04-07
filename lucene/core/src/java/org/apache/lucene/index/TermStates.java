@@ -17,9 +17,13 @@
 package org.apache.lucene.index;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.function.Supplier;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.TaskExecutor;
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.IOBooleanSupplier;
 import org.apache.lucene.util.IOSupplier;
@@ -80,7 +84,7 @@ public final class TermStates {
     register(state, ord, docFreq, totalTermFreq);
   }
 
-  private record PendingTermLookup(TermsEnum termsEnum, IOBooleanSupplier supplier) {}
+  private record TermLookupResult(int ord, TermState state, int docFreq, long totalTermFreq) {}
 
   /**
    * Creates a {@link TermStates} from a top-level {@link IndexReaderContext} and the given {@link
@@ -89,6 +93,9 @@ public final class TermStates {
    * ordinal.
    *
    * <p>Note: the given context must be a top-level context.
+   *
+   * <p>When the IndexSearcher has a concurrent executor, term lookups across segments are fully
+   * parallelized — each segment's trie walk and block read happens on a separate thread.
    *
    * @param needsStats if {@code true} then all leaf contexts will be visited up-front to collect
    *     term statistics. Otherwise, the {@link TermState} objects will be built only when requested
@@ -99,23 +106,33 @@ public final class TermStates {
     assert context != null;
     final TermStates perReaderTermState = new TermStates(needsStats ? null : term, context);
     if (needsStats) {
-      PendingTermLookup[] pendingTermLookups = new PendingTermLookup[0];
-      for (LeafReaderContext ctx : context.leaves()) {
-        Terms terms = Terms.getTerms(ctx.reader(), term.field());
-        TermsEnum termsEnum = terms.iterator();
-        // Schedule the I/O in the terms dictionary in the background.
-        IOBooleanSupplier termExistsSupplier = termsEnum.prepareSeekExact(term.bytes());
-        if (termExistsSupplier != null) {
-          pendingTermLookups = ArrayUtil.grow(pendingTermLookups, ctx.ord + 1);
-          pendingTermLookups[ctx.ord] = new PendingTermLookup(termsEnum, termExistsSupplier);
-        }
+      TaskExecutor taskExecutor = indexSearcher.getTaskExecutor();
+      List<LeafReaderContext> leaves = context.leaves();
+
+      // Build one task per segment: each task does the full term lookup (trie walk + block read)
+      // independently. No sequential IO across segments.
+      List<Callable<TermLookupResult>> tasks = new ArrayList<>(leaves.size());
+      for (LeafReaderContext ctx : leaves) {
+        final int ord = ctx.ord;
+        tasks.add(() -> {
+          Terms terms = Terms.getTerms(ctx.reader(), term.field());
+          TermsEnum termsEnum = terms.iterator();
+          // prepareSeekExact does trie walk (IO) + prefetchBlock (async IO)
+          IOBooleanSupplier termExistsSupplier = termsEnum.prepareSeekExact(term.bytes());
+          if (termExistsSupplier != null && termExistsSupplier.get()) {
+            return new TermLookupResult(
+                ord, termsEnum.termState(), termsEnum.docFreq(), termsEnum.totalTermFreq());
+          }
+          return null;
+        });
       }
-      for (int ord = 0; ord < pendingTermLookups.length; ++ord) {
-        PendingTermLookup pendingTermLookup = pendingTermLookups[ord];
-        if (pendingTermLookup != null && pendingTermLookup.supplier.get()) {
-          TermsEnum termsEnum = pendingTermLookup.termsEnum();
+
+      // Execute all segment lookups concurrently and collect results
+      List<TermLookupResult> results = taskExecutor.invokeAll(tasks);
+      for (TermLookupResult result : results) {
+        if (result != null) {
           perReaderTermState.register(
-              termsEnum.termState(), ord, termsEnum.docFreq(), termsEnum.totalTermFreq());
+              result.state(), result.ord(), result.docFreq(), result.totalTermFreq());
         }
       }
     }
