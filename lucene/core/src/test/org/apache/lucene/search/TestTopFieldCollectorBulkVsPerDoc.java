@@ -45,35 +45,35 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
   public void testDescLongSort() throws Exception {
     doTestBulkVsPerDoc(
         new Sort(new SortField("ndv", SortField.Type.LONG, true)),
-        10, 1000, new MatchAllDocsQuery());
+        50, 200000, new MatchAllDocsQuery());
   }
 
   /** Asc sort on long field. */
   public void testAscLongSort() throws Exception {
     doTestBulkVsPerDoc(
         new Sort(new SortField("ndv", SortField.Type.LONG, false)),
-        10, 1000, new MatchAllDocsQuery());
+        50, 200000, new MatchAllDocsQuery());
   }
 
   /** Sort with a filter query — not all docs match. */
   public void testFilteredSort() throws Exception {
     doTestBulkVsPerDoc(
         new Sort(new SortField("ndv", SortField.Type.LONG, true)),
-        10, 2000, new TermQuery(new Term("s", "a")));
+        50, 200000, new TermQuery(new Term("s", "a")));
   }
 
   /** Sort with topN=1 — queue is always full after first hit. */
   public void testTopOne() throws Exception {
     doTestBulkVsPerDoc(
         new Sort(new SortField("ndv", SortField.Type.LONG, true)),
-        1, 1000, new MatchAllDocsQuery());
+        1, 100000, new MatchAllDocsQuery());
   }
 
   /** Sort with large topN — many docs in the queue. */
   public void testLargeTopN() throws Exception {
     doTestBulkVsPerDoc(
         new Sort(new SortField("ndv", SortField.Type.LONG, true)),
-        200, 1000, new MatchAllDocsQuery());
+        200, 200000, new MatchAllDocsQuery());
   }
 
   /** Sort with missing value set to MAX_VALUE. */
@@ -102,7 +102,7 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
   /** SearchAfter pagination — PagingFieldCollector path. */
   public void testSearchAfterPagination() throws Exception {
     try (Directory dir = newDirectory()) {
-      indexDocs(dir, 3000);
+      indexDocs(dir, 200000);
       Sort sort = new Sort(new SortField("ndv", SortField.Type.LONG, true));
       int pageSize = 50;
 
@@ -208,11 +208,12 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
 
   private void indexDocs(Directory dir, int numDocs) throws IOException {
     IndexWriterConfig conf = new IndexWriterConfig();
-    conf.setMaxBufferedDocs(numDocs + 1);
+    conf.setMaxBufferedDocs(Math.min(numDocs + 1, 500001));
     try (IndexWriter w = new IndexWriter(dir, conf)) {
       for (int i = 0; i < numDocs; i++) {
         Document doc = new Document();
         doc.add(new NumericDocValuesField("ndv", random().nextInt(10000)));
+        doc.add(new NumericDocValuesField("ndv2", random().nextInt(5000)));
         // Some docs don't have the field — tests missing value handling
         if (random().nextInt(10) > 0) {
           doc.add(new NumericDocValuesField("ndv_sparse", random().nextLong()));
@@ -223,4 +224,311 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
       w.forceMerge(1);
     }
   }
+
+  // ---- Additional query type tests ----
+
+  /** Boolean query with MUST + FILTER clauses. */
+  public void testBoolMustFilter() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.LONG, true)),
+        50, 200000,
+        new BooleanQuery.Builder()
+            .add(new TermQuery(new Term("s", "a")), BooleanClause.Occur.MUST)
+            .add(new TermQuery(new Term("s", "a")), BooleanClause.Occur.FILTER)
+            .build());
+  }
+
+  /** Boolean query with SHOULD clauses (disjunction). */
+  public void testBoolShould() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.LONG, true)),
+        50, 200000,
+        new BooleanQuery.Builder()
+            .add(new TermQuery(new Term("s", "a")), BooleanClause.Occur.SHOULD)
+            .add(new TermQuery(new Term("s", "b")), BooleanClause.Occur.SHOULD)
+            .build());
+  }
+
+  /** Boolean query with MUST_NOT (exclusion). */
+  public void testBoolMustNot() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.LONG, true)),
+        50, 200000,
+        new BooleanQuery.Builder()
+            .add(new MatchAllDocsQuery(), BooleanClause.Occur.MUST)
+            .add(new TermQuery(new Term("s", "a")), BooleanClause.Occur.MUST_NOT)
+            .build());
+  }
+
+  /** Range query on numeric field + sort. */
+  public void testNumericRangeQuery() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.LONG, true)),
+        50, 200000,
+        NumericDocValuesField.newSlowRangeQuery("ndv", 1000L, 5000L));
+  }
+
+  /** Prefix query on string field + sort. */
+  public void testPrefixQuery() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.LONG, true)),
+        50, 200000,
+        new PrefixQuery(new Term("s", "a")));
+  }
+
+  /** Wildcard query + sort. */
+  public void testWildcardQuery() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.LONG, true)),
+        50, 200000,
+        new WildcardQuery(new Term("s", "a*")));
+  }
+
+  // ---- Multi-field sort variations ----
+
+  /** Two long fields, both descending. */
+  public void testMultiFieldBothDesc() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(
+            new SortField("ndv", SortField.Type.LONG, true),
+            new SortField("ndv2", SortField.Type.LONG, true)),
+        50, 200000, new MatchAllDocsQuery());
+  }
+
+  /** Two long fields, first desc second asc. */
+  public void testMultiFieldMixedDirection() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(
+            new SortField("ndv", SortField.Type.LONG, true),
+            new SortField("ndv2", SortField.Type.LONG, false)),
+        50, 200000, new MatchAllDocsQuery());
+  }
+
+  /** Three fields: long desc, long asc, doc ID. */
+  public void testTripleFieldSort() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(
+            new SortField("ndv", SortField.Type.LONG, true),
+            new SortField("ndv2", SortField.Type.LONG, false),
+            SortField.FIELD_DOC),
+        50, 200000, new MatchAllDocsQuery());
+  }
+
+  /** Multi-field sort with filtered query. */
+  public void testMultiFieldFiltered() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(
+            new SortField("ndv", SortField.Type.LONG, true),
+            new SortField("ndv2", SortField.Type.LONG, true)),
+        50, 200000,
+        new TermQuery(new Term("s", "a")));
+  }
+
+  /** Multi-field sort with missing values. */
+  public void testMultiFieldMissingValues() throws Exception {
+    SortField sf1 = new SortField("ndv", SortField.Type.LONG, true);
+    sf1.setMissingValue(Long.MAX_VALUE);
+    SortField sf2 = new SortField("ndv2", SortField.Type.LONG, false);
+    sf2.setMissingValue(Long.MIN_VALUE);
+    doTestBulkVsPerDoc(new Sort(sf1, sf2), 50, 200000, new MatchAllDocsQuery());
+  }
+
+  // ---- Edge cases ----
+
+  /** Very few matching docs (less than topN). */
+  public void testFewMatchingDocs() throws Exception {
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < 100000; i++) {
+          Document doc = new Document();
+          doc.add(new NumericDocValuesField("ndv", random().nextInt(10000)));
+          // Only 5 docs have "rare" term
+          doc.add(new StringField("s", i < 50 ? "rare" : "common", Store.NO));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = newSearcher(reader, true, true, false);
+        Sort sort = new Sort(new SortField("ndv", SortField.Type.LONG, true));
+
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulk = searcher.search(new TermQuery(new Term("s", "rare")), 100, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDoc = searcher.search(new TermQuery(new Term("s", "rare")), 100, sort);
+        PrefetchConfig.setEnabled(true);
+
+        assertResultsMatch("fewDocs", perDoc, bulk);
+      }
+    }
+  }
+
+  /** All docs have the same sort value — tests tie-breaking. */
+  public void testAllSameValue() throws Exception {
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < 100000; i++) {
+          Document doc = new Document();
+          doc.add(new NumericDocValuesField("ndv", 42L));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = newSearcher(reader, true, true, false);
+        Sort sort = new Sort(new SortField("ndv", SortField.Type.LONG, true));
+
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulk = searcher.search(new MatchAllDocsQuery(), 20, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDoc = searcher.search(new MatchAllDocsQuery(), 20, sort);
+        PrefetchConfig.setEnabled(true);
+
+        assertResultsMatch("allSame", perDoc, bulk);
+      }
+    }
+  }
+
+  /** SearchAfter with multi-field sort. */
+  public void testSearchAfterMultiField() throws Exception {
+    try (Directory dir = newDirectory()) {
+      indexDocs(dir, 200000);
+      Sort sort = new Sort(
+          new SortField("ndv", SortField.Type.LONG, true),
+          SortField.FIELD_DOC);
+      int pageSize = 30;
+
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = newSearcher(reader, true, true, false);
+
+        TopFieldDocs firstPage = searcher.search(new MatchAllDocsQuery(), pageSize, sort);
+        FieldDoc lastDoc = (FieldDoc) firstPage.scoreDocs[firstPage.scoreDocs.length - 1];
+
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulkPage = (TopFieldDocs) searcher.searchAfter(lastDoc, new MatchAllDocsQuery(), pageSize, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDocPage = (TopFieldDocs) searcher.searchAfter(lastDoc, new MatchAllDocsQuery(), pageSize, sort);
+        PrefetchConfig.setEnabled(true);
+
+        assertResultsMatch("searchAfterMulti", perDocPage, bulkPage);
+      }
+    }
+  }
+
+  /** Randomized multi-field sort with random queries. */
+  public void testRandomizedMultiField() throws Exception {
+    int numDocs = 100000 + random().nextInt(400000);
+    int topN = 1 + random().nextInt(Math.min(numDocs, 200));
+    int numSortFields = 2 + random().nextInt(2); // 2-3 fields
+    SortField[] sortFields = new SortField[numSortFields];
+    for (int i = 0; i < numSortFields; i++) {
+      String field = i == 0 ? "ndv" : "ndv2";
+      boolean reverse = random().nextBoolean();
+      SortField sf = new SortField(field, SortField.Type.LONG, reverse);
+      if (random().nextBoolean()) {
+        sf.setMissingValue(reverse ? Long.MIN_VALUE : Long.MAX_VALUE);
+      }
+      sortFields[i] = sf;
+    }
+    Query query = random().nextBoolean()
+        ? new MatchAllDocsQuery()
+        : new TermQuery(new Term("s", random().nextBoolean() ? "a" : "b"));
+    doTestBulkVsPerDoc(new Sort(sortFields), topN, numDocs, query);
+  }
+
+
+  // ---- Block boundary tests ----
+  // These use doc counts that cross key boundaries in the bulk collection path.
+
+  /** 5000 docs — crosses the 4096 DocIdStream batch boundary. */
+  public void testCrossBatchBoundary() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.LONG, true)),
+        50, 100000, new MatchAllDocsQuery());
+  }
+
+  /** 10000 docs — multiple DocIdStream batches (4096 + 4096 + 1808). */
+  public void testMultipleBatches() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.LONG, true)),
+        100, 200000, new MatchAllDocsQuery());
+  }
+
+  /** 20000 docs with filtered query — sparse hits across multiple batches. */
+  public void testSparseHitsAcrossBatches() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.LONG, true)),
+        100, 200000, new TermQuery(new Term("s", "a")));
+  }
+
+  /** 70000 docs — crosses the 65536 DISI block boundary for sparse doc values. */
+  public void testCrossDISIBlockBoundary() throws Exception {
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(250000);
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < 200000; i++) {
+          Document doc = new Document();
+          doc.add(new NumericDocValuesField("ndv", random().nextInt(100000)));
+          doc.add(new NumericDocValuesField("ndv2", random().nextInt(50000)));
+          // Sparse field — only every 3rd doc has it, crosses DISI block at 65536
+          if (i % 3 == 0) {
+            doc.add(new NumericDocValuesField("ndv_sparse", random().nextLong()));
+          }
+          doc.add(new StringField("s", random().nextBoolean() ? "a" : "b", Store.NO));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = newSearcher(reader, true, true, false);
+        Sort sort = new Sort(new SortField("ndv", SortField.Type.LONG, true));
+
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulk = searcher.search(new MatchAllDocsQuery(), 100, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDoc = searcher.search(new MatchAllDocsQuery(), 100, sort);
+        PrefetchConfig.setEnabled(true);
+
+        assertResultsMatch("crossDISI", perDoc, bulk);
+      }
+    }
+  }
+
+  /** Exactly 4096 docs — boundary case for DocIdStream batch. */
+  public void testExactBatchSize() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.LONG, true)),
+        50, 500000, new MatchAllDocsQuery());
+  }
+
+  /** 4097 docs — one doc past the batch boundary. */
+  public void testOnePastBatchBoundary() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.LONG, true)),
+        50, 131073, new MatchAllDocsQuery());
+  }
+
+  /** Large randomized test — 10K-50K docs, random sort, random query. */
+  public void testLargeRandomized() throws Exception {
+    int numDocs = 100000 + random().nextInt(400000);
+    int topN = 10 + random().nextInt(200);
+    boolean reverse = random().nextBoolean();
+    int numSortFields = 1 + random().nextInt(3);
+    SortField[] sortFields = new SortField[numSortFields];
+    for (int i = 0; i < numSortFields; i++) {
+      String field = i == 0 ? "ndv" : "ndv2";
+      sortFields[i] = new SortField(field, SortField.Type.LONG, random().nextBoolean());
+      if (random().nextBoolean()) {
+        sortFields[i].setMissingValue(random().nextBoolean() ? Long.MIN_VALUE : Long.MAX_VALUE);
+      }
+    }
+    Query query = random().nextBoolean()
+        ? new MatchAllDocsQuery()
+        : new TermQuery(new Term("s", random().nextBoolean() ? "a" : "b"));
+    doTestBulkVsPerDoc(new Sort(sortFields), topN, numDocs, query);
+  }
+
 }
