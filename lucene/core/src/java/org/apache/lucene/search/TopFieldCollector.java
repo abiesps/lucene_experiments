@@ -84,57 +84,48 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
         this.comparator = new MultiLeafFieldComparator(comparators, reverseMuls);
       }
 
-      // Detect BulkValueComparator support
-      if (needsScores || canSetMinScore) {
-        // Score-based sorts cannot use bulk path
-        this.bulkValueComparator = null;
-        this.bulkDocValues = null;
-        this.bulkMissingValue = 0;
-        this.isMultiSort = false;
-        this.allComparators = null;
-        this.allReverseMul = null;
-        this.firstReverseMul = this.reverseMul;
-      } else if (this.comparator instanceof BulkValueComparator bvc
-              && this.comparator instanceof NumericComparator<?>.NumericLeafComparator nlc) {
-        // Single-field sort with BulkValueComparator
-        this.bulkValueComparator = bvc;
-        this.bulkDocValues = nlc.getDocValues();
-        Object mv = sort.getSort()[0].getMissingValue();
-        this.bulkMissingValue = mv instanceof Number n ? n.longValue() : 0L;
-        this.isMultiSort = false;
-        this.allComparators = null;
-        this.allReverseMul = null;
-        this.firstReverseMul = this.reverseMul;
-      } else if (this.comparator instanceof MultiLeafFieldComparator mlfc) {
-        LeafFieldComparator first = mlfc.getFirstComparator();
-        if (first instanceof BulkValueComparator bvc
-                && first instanceof NumericComparator<?>.NumericLeafComparator nlc) {
-          this.bulkValueComparator = bvc;
-          this.bulkDocValues = nlc.getDocValues();
+      // Detect BulkValueComparator support for bulk collect(DocIdStream) path.
+      // Defaults to null (disabled). Only enabled for numeric sorts without scoring.
+      int detectedFirstRevMul = this.reverseMul;
+      BulkValueComparator detectedBvc = null;
+      NumericDocValues detectedDv = null;
+      long detectedMv = 0;
+      boolean detectedMulti = false;
+      LeafFieldComparator[] detectedComps = null;
+      int[] detectedRevMul = null;
+
+      if (!needsScores && !canSetMinScore) {
+        // Try single-field sort
+        if (this.comparator instanceof BulkValueComparator bvc
+                && this.comparator instanceof NumericComparator<?>.NumericLeafComparator nlc) {
+          detectedBvc = bvc;
+          detectedDv = nlc.getDocValues();
           Object mv = sort.getSort()[0].getMissingValue();
-          this.bulkMissingValue = mv instanceof Number n ? n.longValue() : 0L;
-          this.isMultiSort = true;
-          this.allComparators = mlfc.getComparators();
-          this.allReverseMul = mlfc.getReverseMul();
-          this.firstReverseMul = mlfc.getFirstReverseMul();
-        } else {
-          this.bulkValueComparator = null;
-          this.bulkDocValues = null;
-          this.bulkMissingValue = 0;
-          this.isMultiSort = false;
-          this.allComparators = null;
-          this.allReverseMul = null;
-          this.firstReverseMul = this.reverseMul;
+          detectedMv = mv instanceof Number n ? n.longValue() : 0L;
         }
-      } else {
-        this.bulkValueComparator = null;
-        this.bulkDocValues = null;
-        this.bulkMissingValue = 0;
-        this.isMultiSort = false;
-        this.allComparators = null;
-        this.allReverseMul = null;
-        this.firstReverseMul = this.reverseMul;
+        // Try multi-field sort (primary field must support bulk)
+        else if (this.comparator instanceof MultiLeafFieldComparator mlfc) {
+          LeafFieldComparator first = mlfc.getFirstComparator();
+          if (first instanceof BulkValueComparator bvc
+                  && first instanceof NumericComparator<?>.NumericLeafComparator nlc) {
+            detectedBvc = bvc;
+            detectedDv = nlc.getDocValues();
+            Object mv = sort.getSort()[0].getMissingValue();
+            detectedMv = mv instanceof Number n ? n.longValue() : 0L;
+            detectedMulti = true;
+            detectedComps = mlfc.getComparators();
+            detectedRevMul = mlfc.getReverseMul();
+            detectedFirstRevMul = mlfc.getFirstReverseMul();
+          }
+        }
       }
+      this.bulkValueComparator = detectedBvc;
+      this.bulkDocValues = detectedDv;
+      this.bulkMissingValue = detectedMv;
+      this.isMultiSort = detectedMulti;
+      this.allComparators = detectedComps;
+      this.allReverseMul = detectedRevMul;
+      this.firstReverseMul = detectedFirstRevMul;
     }
 
     void countHit() throws IOException {

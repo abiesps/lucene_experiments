@@ -277,23 +277,23 @@ public class TestLucene90DocValuesPrefetchCoverage extends LuceneTestCase {
 
   /** Dense field with sequential values — exercises prefetchFixedBPV on packed data. */
   public void testPrefetchCoverageDenseFixedBPV() throws Exception {
-    doTestPrefetchCoverage(1000, i -> (long) i, true);
+    doTestPrefetchCoverage(200000, i -> (long) i, true);
   }
 
   /** Dense field with GCD values. */
   public void testPrefetchCoverageDenseGCD() throws Exception {
-    doTestPrefetchCoverage(1000, i -> 3L + 7L * i, true);
+    doTestPrefetchCoverage(200000, i -> 3L + 7L * i, true);
   }
 
   /** Dense field with table values. */
   public void testPrefetchCoverageDenseTable() throws Exception {
     long[] table = {10, 20, 30, 40, 50};
-    doTestPrefetchCoverage(1000, i -> table[i % table.length], true);
+    doTestPrefetchCoverage(200000, i -> table[i % table.length], true);
   }
 
   /** Sparse field — exercises prefetchDISI + prefetchFixedBPV on DISI indices. */
   public void testPrefetchCoverageSparse() throws Exception {
-    doTestPrefetchCoverage(2000, i -> (long) i * 100, false);
+    doTestPrefetchCoverage(200000, i -> (long) i * 100, false);
   }
 
   /** Large dense field to span multiple cache blocks. */
@@ -311,7 +311,7 @@ public class TestLucene90DocValuesPrefetchCoverage extends LuceneTestCase {
     try (Directory baseDir = newDirectory()) {
       // Index docs
       IndexWriterConfig conf = new IndexWriterConfig();
-      conf.setMaxBufferedDocs(numDocs + 1);
+      conf.setMaxBufferedDocs(Math.min(numDocs + 1, 500001));
       try (IndexWriter w = new IndexWriter(baseDir, conf)) {
         for (int i = 0; i < numDocs; i++) {
           Document doc = new Document();
@@ -350,4 +350,46 @@ public class TestLucene90DocValuesPrefetchCoverage extends LuceneTestCase {
       }
     }
   }
+
+  /** Dense varying BPV — values with different ranges per 16384-doc block. */
+  public void testPrefetchCoverageDenseVaryingBPV() throws Exception {
+    // Use values that vary wildly to force varying BPV encoding:
+    // first 16384 docs: small values (low bpv), next 16384: large values (high bpv)
+    doTestPrefetchCoverage(50000, i -> {
+      if (i < 16384) return (long) (i % 100);           // low bpv block
+      else if (i < 32768) return (long) i * 1_000_000L; // high bpv block
+      else return (long) (i % 50);                       // low bpv block again
+    }, true);
+  }
+
+  /** Sparse constant — all existing docs have the same value. */
+  public void testPrefetchCoverageSparseConstant() throws Exception {
+    doTestPrefetchCoverage(200000, i -> 42L, false);
+  }
+
+  /** Sparse GCD — values are multiples of a common divisor. */
+  public void testPrefetchCoverageSparseGCD() throws Exception {
+    doTestPrefetchCoverage(200000, i -> 7L * i + 3, false);
+  }
+
+  /** Sparse table — few unique values among sparse docs. */
+  public void testPrefetchCoverageSparseTable() throws Exception {
+    long[] table = {10, 20, 30, 40, 50};
+    doTestPrefetchCoverage(200000, i -> table[i % table.length], false);
+  }
+
+  /** Sparse varying BPV — sparse docs with varying value ranges. */
+  public void testPrefetchCoverageSparseVaryingBPV() throws Exception {
+    doTestPrefetchCoverage(50000, i -> {
+      if (i < 16384) return (long) (i % 100);
+      else if (i < 32768) return (long) i * 1_000_000L;
+      else return (long) (i % 50);
+    }, false);
+  }
+
+  /** Large sparse crossing DISI block boundary (65536). */
+  public void testPrefetchCoverageLargeSparse() throws Exception {
+    doTestPrefetchCoverage(100000, i -> (long) i * 31, false);
+  }
+
 }

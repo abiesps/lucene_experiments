@@ -21,7 +21,6 @@ import static org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat.SKIP_IND
 import static org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat.TERMS_DICT_BLOCK_LZ4_SHIFT;
 
 import java.io.IOException;
-import java.util.Arrays;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.DocValuesProducer;
 import org.apache.lucene.index.BaseTermsEnum;
@@ -44,9 +43,9 @@ import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.index.TermsEnum.SeekStatus;
 import org.apache.lucene.internal.hppc.IntObjectHashMap;
 import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.search.PrefetchConfig;
 import org.apache.lucene.store.ByteArrayDataInput;
 import org.apache.lucene.store.ChecksumIndexInput;
+import org.apache.lucene.search.PrefetchConfig;
 import org.apache.lucene.store.DataInput;
 import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IndexInput;
@@ -60,78 +59,6 @@ import org.apache.lucene.util.packed.DirectMonotonicReader;
 import org.apache.lucene.util.packed.DirectReader;
 
 /** reader for {@link Lucene90DocValuesFormat} */
-/*
- * ===== Bulk Prefetch Design =====
- *
- * This producer overrides NumericDocValues.longValues() on each inner class to issue
- * prefetch calls before reading values. The correctness of each prefetch depends on the
- * on-disk storage format. Below is the format for each variant and why the prefetch offsets
- * are correct.
- *
- * --- Storage Format Overview ---
- *
- * Numeric doc values are stored in the .dvd file. Each field's values occupy a contiguous
- * region at [valuesOffset, valuesOffset + valuesLength). The encoding depends on the data:
- *
- *   1. Constant (bpv=0): No per-doc data. All docs share entry.minValue.
- *      → No value prefetch needed. Sparse variants only need DISI prefetch.
- *
- *   2. Fixed BPV (blockShift < 0): A single block of packed integers.
- *      Values are bit-packed at a fixed bitsPerValue using DirectWriter/DirectReader.
- *      The byte offset for doc D is: (D * bitsPerValue) / 8, reading 1/2/4/8 bytes
- *      depending on bpv (1-8→1B, 12-16→2B, 20-32→4B, 40-64→8B).
- *      Three sub-variants share this layout:
- *        - TABLE: raw value is an index into a lookup table (≤256 unique values)
- *        - GCD:   raw value is (storedValue - minValue) / gcd
- *        - PLAIN: raw value is storedValue - minValue (delta from min)
- *      → prefetchFixedBPV() computes byte offsets from doc IDs and bpv, then calls
- *        slice.prefetch(offset, readSize) for each position. For dense batches it
- *        prefetches a contiguous byte range; for sparse batches it prefetches per-doc.
- *
- *   3. Varying BPV (blockShift >= 0): Values split into blocks of 2^blockShift docs.
- *      Each block has its own bpv. A rankSlice stores block start offsets.
- *      To read doc D: compute block = D >>> blockShift, read rankSlice[block] to get
- *      the block's data offset, then read the packed value within the block.
- *      → Two-round prefetch: (1) prefetch rankSlice entries for the block range,
- *        (2) read block offsets, prefetch the value data ranges.
- *
- * --- Dense vs Sparse ---
- *
- * Dense fields (docsWithFieldOffset == -1): All docs have values. The DISI index equals
- * the doc ID, so positions passed to prefetchFixedBPV are doc IDs directly.
- *
- * Sparse fields (docsWithFieldOffset >= 0): Only some docs have values. An IndexedDISI
- * structure maps doc IDs to dense indices. The on-disk layout is:
- *
- *   DISI data:  blocks of 65536 docs, each SPARSE (shorts), DENSE (bitset), or ALL
- *   Jump table: int[numBlocks] pairs of (docCount, dataOffset) for O(1) block access
- *
- * For sparse fields, the longValues() flow is:
- *   (1) prefetchDISI: prefetch jump table entries and DISI data blocks for the batch
- *   (2) traverseDISI: call disi.advanceExact(doc) for each doc, record exists[] and index[]
- *   (3) prefetch value data using DISI indices (not doc IDs) as positions
- *   (4) read values using rawValues.get(index) with appropriate decode
- *
- * The DISI prefetch is correct because:
- *   - Jump table entry for block B is at offset B * 8 (two ints = 8 bytes)
- *   - DISI data offset for block B is read from jumpTable[B].dataOffset
- *   - Prefetching these before traverseDISI ensures the advanceExact calls hit warm cache
- *
- * The value prefetch after DISI traversal is correct because:
- *   - For fixed BPV: positions are DISI indices (not doc IDs), byte offset = (index * bpv) / 8
- *   - For varying BPV: positions are DISI indices, block = index >>> blockShift
- *
- * --- Density-Aware Strategy Selection ---
- *
- * usePerDocPrefetch(densityRatio, bpv, multiplier) selects between:
- *   - Contiguous: single prefetch(firstByte, lastByte - firstByte) — good for dense batches
- *   - Per-doc: one prefetch per position — good for scattered batches
- *
- * The threshold is: densityRatio > blockCapacity * multiplier, where
- * blockCapacity = (cacheBlockSize * 8) / bpv = number of values per cache block.
- * When docs are spread across more cache blocks than the batch size, per-doc is better
- * because contiguous prefetch would load many unused blocks.
- */
 final class Lucene90DocValuesProducer extends DocValuesProducer {
   private final IntObjectHashMap<NumericEntry> numerics;
   private final IntObjectHashMap<BinaryEntry> binaries;
@@ -592,795 +519,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     public int docIDRunEnd() throws IOException {
       return disi.docIDRunEnd();
     }
-
-    /**
-     * Traverses the DISI for a batch of sorted doc IDs, recording existence and index information
-     * into parallel arrays. For each doc in docs[0..size-1], calls disi.advanceExact(docs[i]) and
-     * records the result in exists[i]. If the doc exists, records disi.index() in indices[i].
-     *
-     * @param size number of doc IDs to process
-     * @param docs sorted ascending doc IDs (no duplicates)
-     * @param indices output array for DISI indices (only valid where exists[i] is true)
-     * @param exists output array for existence flags
-     */
-    void traverseDISI(int size, int[] docs, int off, int[] indices, boolean[] exists) throws IOException {
-      for (int i = 0; i < size; i++) {
-        exists[i] = disi.advanceExact(docs[off + i]);
-        if (exists[i]) {
-          indices[i] = disi.index();
-        }
-      }
-    }
-
-    /**
-     * Prefetches DISI jump table and DISI data blocks for a batch of doc IDs. Computes the DISI
-     * block range from {@code docs[0] >>> 16} to {@code docs[size-1] >>> 16} and uses either a
-     * contiguous or per-doc prefetch strategy based on the {@code perDoc} flag.
-     *
-     * <p>Contiguous strategy: prefetch jump table entries for the block range, read first/last
-     * entries to get data offset range, prefetch the data range.
-     *
-     * <p>Per-doc strategy: prefetch jump table entries per doc's block individually, read entries to
-     * get data offsets, prefetch data blocks per doc.
-     *
-     * @param size number of doc IDs to process (must be &gt; 0)
-     * @param docs sorted ascending doc IDs (no duplicates)
-     * @param perDoc true to use per-doc block-based prefetch, false for contiguous range prefetch
-     * @throws IOException if prefetch or read calls fail
-     */
-    void prefetchDISI(int size, int[] docs, int off, boolean perDoc) throws IOException {
-      final RandomAccessInput jumpTable = disi.jumpTable;
-      final IndexInput slice = disi.slice;
-
-      if (jumpTable == null) {
-        return;
-      }
-
-      final int firstBlock = docs[off] >>> 16;
-      final int lastBlock = docs[off + size - 1] >>> 16;
-
-      if (perDoc) {
-        // Per-doc strategy: prefetch jump table entries per doc's block individually
-        int prevBlock = -1;
-        for (int i = 0; i < size; i++) {
-          int block = docs[off + i] >>> 16;
-          if (block != prevBlock && block < disi.jumpTableEntryCount) {
-            long jtOffset = (long) block * Integer.BYTES * 2;
-            jumpTable.prefetch(jtOffset, Integer.BYTES * 2);
-            prevBlock = block;
-          }
-        }
-        // Read jump table entries to get data offsets, prefetch DISI data blocks per doc
-        prevBlock = -1;
-        for (int i = 0; i < size; i++) {
-          int block = docs[off + i] >>> 16;
-          if (block != prevBlock && block < disi.jumpTableEntryCount) {
-            long jtOffset = (long) block * Integer.BYTES * 2;
-            int dataOffset = jumpTable.readInt(jtOffset + Integer.BYTES);
-            slice.prefetch(dataOffset, 1);
-            prevBlock = block;
-          }
-        }
-      } else {
-        // Contiguous strategy: prefetch jump table entries for block range
-        int clampedFirst = Math.min(firstBlock, disi.jumpTableEntryCount - 1);
-        int clampedLast = Math.min(lastBlock, disi.jumpTableEntryCount - 1);
-        if (clampedFirst >= 0 && clampedLast >= clampedFirst) {
-          long jtFirstByte = (long) clampedFirst * Integer.BYTES * 2;
-          long jtLastByte = ((long) clampedLast + 1) * Integer.BYTES * 2;
-          jumpTable.prefetch(jtFirstByte, jtLastByte - jtFirstByte);
-
-          // Read first and last jump table entries to get data offset range, prefetch data range
-          int dataStartOffset = jumpTable.readInt(jtFirstByte + Integer.BYTES);
-          int dataEndOffset =
-              jumpTable.readInt((long) clampedLast * Integer.BYTES * 2 + Integer.BYTES);
-          // Prefetch the DISI data range between first and last block
-          if (dataEndOffset >= dataStartOffset) {
-            // Add some extra bytes to cover the last block's data
-            slice.prefetch(dataStartOffset, (long) dataEndOffset - dataStartOffset + (1 << 13));
-          }
-        }
-      }
-    }
-  }
-
-  /**
-   * Dense NumericDocValues for constant-value fields (bitsPerValue == 0). All documents have the
-   * same value (entry.minValue), so no IO or prefetch is needed for value reads.
-   *
-   * <p>Storage: No per-doc data in .dvd. The single value is stored in the metadata (.dvm).
-   *
-   * <p>longValues(): Fills the output array with entry.minValue for all docs. No prefetch needed.
-   */
-  private static class DenseConstantDocValues extends DenseNumericDocValues {
-
-    final NumericEntry entry;
-
-    DenseConstantDocValues(int maxDoc, NumericEntry entry) {
-      super(maxDoc);
-      this.entry = entry;
-    }
-
-    @Override
-    public long longValue() throws IOException {
-      return entry.minValue;
-    }
-
-    @Override
-    public void longValues(int size, int[] docs, long[] values, long defaultValue)
-        throws IOException {
-      Arrays.fill(values, 0, size, entry.minValue);
-    }
-  }
-
-  /**
-   * Determines whether to use per-doc block-based prefetch or contiguous range prefetch.
-   *
-   * @param densityRatio (docs[size-1] - docs[0]) / size — measures how spread out the doc IDs are
-   * @param bitsPerValue the encoding's bits per value
-   * @param densityMultiplier configurable threshold multiplier (default 1)
-   * @return true if per-doc prefetch should be used (sparse batch), false for contiguous range
-   */
-  static boolean usePerDocPrefetch(long densityRatio, int bitsPerValue, int densityMultiplier) {
-    if (bitsPerValue == 0) return false; // no IO needed
-    long blockCapacity = (32768L * 8) / bitsPerValue;
-    return densityRatio > blockCapacity * densityMultiplier;
-  }
-
-  /**
-   * Prefetches byte ranges for fixed bits-per-value encoded values from a {@link
-   * RandomAccessInput}. Computes byte offsets from positions (doc IDs for dense fields, DISI
-   * indices for sparse fields) and bitsPerValue, then calls {@code slice.prefetch()} using either a
-   * contiguous range or per-position strategy based on {@link #usePerDocPrefetch}.
-   *
-   * <p>For {@code size == 1}, always uses the per-position strategy (single prefetch). For {@code
-   * size > 1}, computes the density ratio and delegates to {@link #usePerDocPrefetch} to select the
-   * strategy.
-   *
-   * @param size number of positions to prefetch (must be &gt; 0)
-   * @param positions array of positions (doc IDs or DISI indices), sorted ascending, no duplicates
-   * @param slice the RandomAccessInput backing the packed values
-   * @param bitsPerValue the encoding's bits per value (must be &gt; 0)
-   * @throws IOException if prefetch calls fail
-   */
-  static void prefetchFixedBPV(int size, int[] positions, RandomAccessInput slice, int bitsPerValue)
-      throws IOException {
-    assert size > 0 : "size must be > 0";
-    assert bitsPerValue > 0 : "bitsPerValue must be > 0; constant fields should skip prefetch";
-
-    // Compute the read size used by DirectReader for this bpv:
-    // bpv 1-8: readByte (1), bpv 12-16: readShort (2), bpv 20-32: readInt (4), bpv 40-64:
-    // readLong (8)
-    int readSize = bitsPerValue <= 8 ? 1 : bitsPerValue <= 16 ? 2 : bitsPerValue <= 32 ? 4 : 8;
-
-    if (size == 1) {
-      // Single position: per-doc strategy (single prefetch)
-      long byteOffset = ((long) positions[0] * bitsPerValue) / 8;
-      slice.prefetch(byteOffset, readSize);
-    } else {
-      long densityRatio = ((long) positions[size - 1] - positions[0]) / size;
-      if (usePerDocPrefetch(densityRatio, bitsPerValue, 1)) {
-        // Per-doc block-based prefetch for sparse/scattered batches
-        for (int i = 0; i < size; i++) {
-          long byteOffset = ((long) positions[i] * bitsPerValue) / 8;
-          slice.prefetch(byteOffset, readSize);
-        }
-      } else {
-        // Contiguous range prefetch for dense batches
-        long firstByte = ((long) positions[0] * bitsPerValue) / 8;
-        long lastByte = ((long) positions[size - 1] * bitsPerValue) / 8 + readSize;
-        slice.prefetch(firstByte, lastByte - firstByte);
-      }
-    }
-  }
-
-  /**
-   * Dense NumericDocValues for fixed bits-per-value fields (blockShift &lt; 0, single block).
-   * Handles TABLE, GCD, and PLAIN encoding variants with a single class.
-   *
-   * <p>Storage: Values are packed at a fixed bitsPerValue in a contiguous region of .dvd at
-   * [valuesOffset, valuesOffset + valuesLength). For doc D, the byte offset is (D * bpv) / 8.
-   * DirectReader reads 1/2/4/8 bytes depending on bpv.
-   *
-   * <p>longValues() prefetch: Calls prefetchFixedBPV(size, docs, slice, bpv) which computes byte
-   * offsets from doc IDs (positions = doc IDs for dense fields) and issues slice.prefetch() calls.
-   * For dense batches (docs close together), a single contiguous prefetch covers the range. For
-   * scattered batches, per-doc prefetches target individual cache blocks. After prefetch, the read
-   * loop calls rawValues.get(doc) which hits warm cache.
-   */
-  private static class DenseFixedBPVDocValues extends DenseNumericDocValues {
-
-    /** Encoding variant for fixed BPV dense doc values. */
-    enum Encoding {
-      TABLE,
-      GCD,
-      PLAIN
-    }
-
-    final NumericEntry entry;
-    final RandomAccessInput slice;
-    final LongValues rawValues;
-    final Encoding encoding;
-    // Encoding-specific fields
-    final long[] table; // non-null for TABLE encoding
-    final long mul; // GCD multiplier (used for GCD encoding)
-    final long delta; // min value delta (used for GCD encoding)
-
-    DenseFixedBPVDocValues(
-        int maxDoc,
-        NumericEntry entry,
-        RandomAccessInput slice,
-        LongValues rawValues,
-        Encoding encoding,
-        long[] table,
-        long mul,
-        long delta) {
-      super(maxDoc);
-      this.entry = entry;
-      this.slice = slice;
-      this.rawValues = rawValues;
-      this.encoding = encoding;
-      this.table = table;
-      this.mul = mul;
-      this.delta = delta;
-    }
-
-    @Override
-    public long longValue() throws IOException {
-      return switch (encoding) {
-        case TABLE -> table[(int) rawValues.get(doc)];
-        case GCD -> mul * rawValues.get(doc) + delta;
-        case PLAIN -> rawValues.get(doc);
-      };
-    }
-
-    private long decode(long raw) {
-      return switch (encoding) {
-        case TABLE -> table[(int) raw];
-        case GCD -> mul * raw + delta;
-        case PLAIN -> raw;
-      };
-    }
-
-    @Override
-    public void longValues(int size, int[] docs, long[] values, long defaultValue)
-        throws IOException {
-      if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
-      if (size == 0) return;
-
-      // Prefetch value byte ranges using shared helper (positions = doc IDs for dense fields)
-      if (entry.bitsPerValue > 0) {
-        // Debug logging: log prefetch range for sort validation
-        if (PrefetchConfig.isDebugEnabled()) {
-          int readSize = entry.bitsPerValue <= 8 ? 1 : entry.bitsPerValue <= 16 ? 2 : entry.bitsPerValue <= 32 ? 4 : 8;
-          long firstByte = ((long) docs[0] * entry.bitsPerValue) / 8;
-          long lastByte = ((long) docs[size - 1] * entry.bitsPerValue) / 8 + readSize;
-          long totalBytes = lastByte - firstByte;
-          int blockSize = PrefetchConfig.getCacheBlockSize();
-          long firstBlock = firstByte / blockSize;
-          long lastBlock = (lastByte - 1) / blockSize;
-          long blockCount = lastBlock - firstBlock + 1;
-          System.err.println("[PREFETCH-SORT] bpv=" + entry.bitsPerValue
-              + " size=" + size
-              + " docs[0]=" + docs[0] + " docs[last]=" + docs[size - 1]
-              + " prefetchRange=[" + firstByte + "," + lastByte + ")"
-              + " bytes=" + totalBytes
-              + " blockSize=" + blockSize
-              + " blocks=" + blockCount
-              + " blockRange=[" + firstBlock + "," + lastBlock + "]");
-        }
-        prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
-      }
-
-      // Read values with appropriate decode
-      for (int i = 0; i < size; i++) {
-        values[i] = decode(rawValues.get(docs[i]));
-      }
-    }
-  }
-
-  /**
-   * Dense NumericDocValues for varying bits-per-value fields (blockShift &gt;= 0). Values are split
-   * into blocks of 2^blockShift docs, each with its own bitsPerValue.
-   *
-   * <p>Storage: A rankSlice stores the absolute .dvd offset for each block's start. Each block
-   * begins with a byte (bpv), a long (delta/min), optionally an int (data length), then packed
-   * values. For doc D: block = D &gt;&gt;&gt; blockShift, read rankSlice[block] to get the block's
-   * .dvd offset, then read the packed value at position (D &amp; blockMask) within the block.
-   *
-   * <p>longValues() prefetch: Two-round strategy:
-   *
-   * <ol>
-   *   <li>Round 1: Prefetch rankSlice entries for the block range [firstBlock, lastBlock]. Each
-   *       entry is 8 bytes (a long). For dense batches, one contiguous prefetch. For scattered
-   *       batches, per-block prefetches.
-   *   <li>Round 2: Read rankSlice entries to get block data offsets, then prefetch the value data
-   *       ranges. For dense batches, one contiguous prefetch from first block's offset to last
-   *       block's end. For scattered batches, per-block data prefetches.
-   * </ol>
-   *
-   * <p>This is correct because the rankSlice is a flat array of longs indexed by block number, and
-   * each block's data is at the offset stored in the rankSlice entry.
-   */
-  private class DenseVaryingBPVDocValues extends DenseNumericDocValues {
-
-    final NumericEntry entry;
-    final RandomAccessInput slice;
-    final VaryingBPVReader vBPVReader;
-
-    DenseVaryingBPVDocValues(int maxDoc, NumericEntry entry, RandomAccessInput slice)
-        throws IOException {
-      super(maxDoc);
-      this.entry = entry;
-      this.slice = slice;
-      this.vBPVReader = new VaryingBPVReader(entry, slice);
-    }
-
-    @Override
-    public long longValue() throws IOException {
-      return vBPVReader.getLongValue(doc);
-    }
-
-    @Override
-    public void longValues(int size, int[] docs, long[] values, long defaultValue)
-        throws IOException {
-      if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
-      if (size == 0) return;
-
-      final int shift = vBPVReader.shift;
-      final RandomAccessInput rankSlice = vBPVReader.rankSlice;
-
-      // If there's no rankSlice, fall back to sequential reads
-      if (rankSlice == null) {
-        for (int i = 0; i < size; i++) {
-          values[i] = vBPVReader.getLongValue(docs[i]);
-        }
-        return;
-      }
-
-      final long firstBlock = Integer.toUnsignedLong(docs[0]) >>> shift;
-      final long lastBlock = Integer.toUnsignedLong(docs[size - 1]) >>> shift;
-
-      // Compute density ratio for strategy selection
-      // Use 64 bits (Long.BYTES * 8) as the effective bpv for rankSlice entries
-      if (size == 1) {
-        // Single doc: prefetch the one rankSlice entry, then read data offset and prefetch data
-        long rankOffset = firstBlock * Long.BYTES;
-        rankSlice.prefetch(rankOffset, Long.BYTES);
-
-        // Round 2: read rankSlice entry to get data offset, prefetch value data
-        long blockStartOffset = rankSlice.readLong(firstBlock * Long.BYTES) - entry.valuesOffset;
-        // Read the bpv byte to determine block size and prefetch the entire block
-        int bitsPerValue = Byte.toUnsignedInt(slice.readByte(blockStartOffset));
-        if (bitsPerValue != 0) {
-          int length = slice.readInt(blockStartOffset + 1 + Long.BYTES);
-          slice.prefetch(blockStartOffset, 1 + Long.BYTES + Integer.BYTES + length);
-        } else {
-          slice.prefetch(blockStartOffset, 1 + Long.BYTES);
-        }
-      } else {
-        long densityRatio = ((long) docs[size - 1] - docs[0]) / size;
-        // For rankSlice: each entry is Long.BYTES (8 bytes) = 64 bits
-        if (usePerDocPrefetch(densityRatio, Long.BYTES * 8, 1)) {
-          // Per-doc strategy: prefetch rankSlice entries per doc's block individually
-          // Round 1: prefetch rankSlice entries
-          long prevBlock = -1;
-          for (int i = 0; i < size; i++) {
-            long block = Integer.toUnsignedLong(docs[i]) >>> shift;
-            if (block != prevBlock) {
-              rankSlice.prefetch(block * Long.BYTES, Long.BYTES);
-              prevBlock = block;
-            }
-          }
-
-          // Round 2: read rankSlice entries to get data offsets, prefetch value data blocks
-          prevBlock = -1;
-          for (int i = 0; i < size; i++) {
-            long block = Integer.toUnsignedLong(docs[i]) >>> shift;
-            if (block != prevBlock) {
-              long blockStartOffset =
-                  rankSlice.readLong(block * Long.BYTES) - entry.valuesOffset;
-              int bitsPerValue = Byte.toUnsignedInt(slice.readByte(blockStartOffset));
-              if (bitsPerValue != 0) {
-                int length = slice.readInt(blockStartOffset + 1 + Long.BYTES);
-                slice.prefetch(blockStartOffset, 1 + Long.BYTES + Integer.BYTES + length);
-              } else {
-                slice.prefetch(blockStartOffset, 1 + Long.BYTES);
-              }
-              prevBlock = block;
-            }
-          }
-        } else {
-          // Contiguous strategy: single prefetch for rankSlice range, then single prefetch for data
-          // Round 1: prefetch rankSlice entries for the block range
-          long rankFirstByte = firstBlock * Long.BYTES;
-          long rankLastByte = (lastBlock + 1) * Long.BYTES;
-          rankSlice.prefetch(rankFirstByte, rankLastByte - rankFirstByte);
-
-          // Round 2: read first and last block offsets to determine data range, then prefetch
-          long dataStartOffset =
-              rankSlice.readLong(firstBlock * Long.BYTES) - entry.valuesOffset;
-          long dataEndOffset =
-              rankSlice.readLong(lastBlock * Long.BYTES) - entry.valuesOffset;
-          // Read the last block's header to find its end
-          int lastBlockBpv = Byte.toUnsignedInt(slice.readByte(dataEndOffset));
-          long lastBlockEnd = dataEndOffset + 1 + Long.BYTES; // bpv byte + delta long
-          if (lastBlockBpv != 0) {
-            int length = slice.readInt(dataEndOffset + 1 + Long.BYTES);
-            lastBlockEnd += Integer.BYTES + length;
-          }
-          slice.prefetch(dataStartOffset, lastBlockEnd - dataStartOffset);
-        }
-      }
-
-      // Read values from the now-warm cache
-      for (int i = 0; i < size; i++) {
-        values[i] = vBPVReader.getLongValue(docs[i]);
-      }
-    }
-  }
-
-  /**
-   * Sparse NumericDocValues for constant-value fields (bitsPerValue == 0). Uses IndexedDISI for
-   * existence checks. All existing documents have the same value (entry.minValue).
-   *
-   * <p>Storage: No per-doc value data. The DISI structure maps doc IDs to existence. The DISI
-   * consists of blocks of 65536 docs (SPARSE/DENSE/ALL encoding) with a jump table for O(1) block
-   * access.
-   *
-   * <p>longValues() prefetch: Only DISI prefetch is needed (no value data to prefetch).
-   *
-   * <ol>
-   *   <li>prefetchDISI: Prefetch jump table entries at offset block * 8 (two ints per block), then
-   *       read jump table to get DISI data offsets, prefetch DISI data blocks.
-   *   <li>traverseDISI: Call disi.advanceExact(doc) for each doc, recording exists[i]. The
-   *       advanceExact calls hit warm cache from the prefetch.
-   *   <li>Fill output: entry.minValue where exists[i] is true, defaultValue otherwise.
-   * </ol>
-   */
-  private static class SparseConstantDocValues extends SparseNumericDocValues {
-
-    final NumericEntry entry;
-    final int[] indexScratch = new int[4096];
-    final boolean[] existsScratch = new boolean[4096];
-
-    SparseConstantDocValues(NumericEntry entry, IndexedDISI disi) {
-      super(disi);
-      this.entry = entry;
-    }
-
-    @Override
-    public long longValue() throws IOException {
-      return entry.minValue;
-    }
-
-    @Override
-    public void longValues(int size, int[] docs, long[] values, long defaultValue)
-        throws IOException {
-      if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
-      if (size == 0) return;
-
-      // Process in chunks to avoid overflowing fixed-size scratch arrays
-      final int CHUNK = indexScratch.length;
-      for (int off = 0; off < size; off += CHUNK) {
-        int chunkSize = Math.min(CHUNK, size - off);
-
-        // DISI prefetch (density-aware) — no value data prefetch needed for bpv=0
-        final boolean perDoc;
-        if (chunkSize == 1) {
-          perDoc = true;
-        } else {
-          long densityRatio = ((long) docs[off + chunkSize - 1] - docs[off]) / chunkSize;
-          perDoc = usePerDocPrefetch(densityRatio, Integer.BYTES * 2 * 8, 1);
-        }
-        prefetchDISI(chunkSize, docs, off, perDoc);
-
-        // Traverse DISI for each doc: record existence and index
-        traverseDISI(chunkSize, docs, off, indexScratch, existsScratch);
-
-        // Fill values: entry.minValue for docs that exist, defaultValue for docs that don't
-        for (int i = 0; i < chunkSize; i++) {
-          values[off + i] = existsScratch[i] ? entry.minValue : defaultValue;
-        }
-      }
-    }
-  }
-
-  /**
-   * Sparse NumericDocValues for fixed bits-per-value fields (TABLE, GCD, or PLAIN encoding). Uses
-   * IndexedDISI for existence checks and index lookups.
-   *
-   * <p>Storage: DISI maps doc IDs → dense indices. Value data is packed at fixed bpv, indexed by
-   * DISI index (not doc ID). For a doc with DISI index I, byte offset = (I * bpv) / 8.
-   *
-   * <p>longValues() prefetch flow — note that value positions are DISI indices, not doc IDs:
-   *
-   * <ol>
-   *   <li>prefetchDISI: Prefetch jump table + DISI data blocks for the doc ID range.
-   *   <li>traverseDISI: For each doc, call advanceExact → record exists[i] and index[i]. The DISI
-   *       index is the position in the dense value array.
-   *   <li>prefetchFixedBPV(existingCount, compactIndices, slice, bpv): Prefetch value byte ranges
-   *       using DISI indices as positions. This is correct because the packed values are indexed by
-   *       DISI index, not doc ID. Byte offset for index I = (I * bpv) / 8.
-   *   <li>Read values: rawValues.get(index[i]) with TABLE/GCD/PLAIN decode.
-   *   <li>Fill defaultValue for docs where exists[i] is false.
-   * </ol>
-   */
-  private static class SparseFixedBPVDocValues extends SparseNumericDocValues {
-
-    /** Encoding variant for fixed BPV sparse doc values. */
-    enum Encoding {
-      TABLE,
-      GCD,
-      PLAIN
-    }
-
-    final NumericEntry entry;
-    final RandomAccessInput slice;
-    final LongValues rawValues;
-    final Encoding encoding;
-    // Encoding-specific fields
-    final long[] table; // non-null for TABLE encoding
-    final long mul; // GCD multiplier (used for GCD encoding)
-    final long delta; // min value delta (used for GCD encoding)
-    // Scratch arrays for DISI traversal
-    final int[] indexScratch = new int[4096];
-    final boolean[] existsScratch = new boolean[4096];
-
-    SparseFixedBPVDocValues(
-        NumericEntry entry,
-        IndexedDISI disi,
-        RandomAccessInput slice,
-        LongValues rawValues,
-        Encoding encoding,
-        long[] table,
-        long mul,
-        long delta) {
-      super(disi);
-      this.entry = entry;
-      this.slice = slice;
-      this.rawValues = rawValues;
-      this.encoding = encoding;
-      this.table = table;
-      this.mul = mul;
-      this.delta = delta;
-    }
-
-    @Override
-    public long longValue() throws IOException {
-      return switch (encoding) {
-        case TABLE -> table[(int) rawValues.get(disi.index())];
-        case GCD -> mul * rawValues.get(disi.index()) + delta;
-        case PLAIN -> rawValues.get(disi.index());
-      };
-    }
-
-    private long decode(long raw) {
-      return switch (encoding) {
-        case TABLE -> table[(int) raw];
-        case GCD -> mul * raw + delta;
-        case PLAIN -> raw;
-      };
-    }
-
-    @Override
-    public void longValues(int size, int[] docs, long[] values, long defaultValue)
-        throws IOException {
-      if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
-      if (size == 0) return;
-
-      // Ensure scratch arrays are large enough
-      int[] idxScratch = size <= indexScratch.length ? indexScratch : new int[size];
-      boolean[] exScratch = size <= existsScratch.length ? existsScratch : new boolean[size];
-
-      int bpv = entry.bitsPerValue;
-
-      // Step 1: Compute density ratio for strategy selection
-      final boolean perDoc;
-      if (size == 1) {
-        perDoc = true;
-      } else {
-        long densityRatio = ((long) docs[size - 1] - docs[0]) / size;
-        perDoc = usePerDocPrefetch(densityRatio, bpv, 1);
-      }
-
-      // Step 2: DISI prefetch (density-aware) using shared helper
-      prefetchDISI(size, docs, 0, perDoc);
-
-      // Step 3: Traverse DISI for each doc: record existence and index
-      traverseDISI(size, docs, 0, idxScratch, exScratch);
-
-      // Step 4: Value prefetch (density-aware, using DISI indices not doc IDs)
-      int existingCount = 0;
-      for (int i = 0; i < size; i++) {
-        if (exScratch[i]) {
-          existingCount++;
-        }
-      }
-
-      if (existingCount > 0) {
-        int[] compactIndices = new int[existingCount];
-        int idx = 0;
-        for (int i = 0; i < size; i++) {
-          if (exScratch[i]) {
-            compactIndices[idx++] = idxScratch[i];
-          }
-        }
-        prefetchFixedBPV(existingCount, compactIndices, slice, bpv);
-      }
-
-      // Step 5: Read values with appropriate decode, fill defaultValue for missing docs
-      for (int i = 0; i < size; i++) {
-        if (exScratch[i]) {
-          values[i] = decode(rawValues.get(idxScratch[i]));
-        } else {
-          values[i] = defaultValue;
-        }
-      }
-    }
-  }
-
-  /**
-   * Sparse NumericDocValues for varying bits-per-value fields (blockShift &gt;= 0). Uses IndexedDISI
-   * for existence checks and index lookups. Values are split into blocks indexed by DISI index.
-   *
-   * <p>Storage: Same as DenseVaryingBPVDocValues but positions are DISI indices, not doc IDs. For a
-   * doc with DISI index I: block = I &gt;&gt;&gt; blockShift, rankSlice[block] gives the block's
-   * .dvd offset.
-   *
-   * <p>longValues() prefetch flow — three layers of prefetch:
-   *
-   * <ol>
-   *   <li>prefetchDISI: Prefetch jump table + DISI data blocks for the doc ID range.
-   *   <li>traverseDISI: Map doc IDs → exists[] and DISI indices[].
-   *   <li>Two-round rankSlice prefetch using DISI indices (not doc IDs) for block computation:
-   *       <ul>
-   *         <li>Round 1: Prefetch rankSlice entries for block range [firstIndex &gt;&gt;&gt; shift,
-   *             lastIndex &gt;&gt;&gt; shift]. Each entry is 8 bytes.
-   *         <li>Round 2: Read rankSlice entries to get block data offsets. Prefetch value data from
-   *             first block's offset to last block's end (contiguous) or per-block (scattered).
-   *       </ul>
-   *   <li>Read values: vBPVReader.getLongValue(index[i]) hits warm cache.
-   *   <li>Fill defaultValue for docs where exists[i] is false.
-   * </ol>
-   *
-   * <p>The key correctness point: rankSlice is indexed by DISI index divided by block size, not by
-   * doc ID. After traverseDISI maps doc IDs to DISI indices, the block computation uses these
-   * indices, ensuring the correct rankSlice entries and data blocks are prefetched.
-   */
-  private class SparseVaryingBPVDocValues extends SparseNumericDocValues {
-
-    final NumericEntry entry;
-    final RandomAccessInput slice;
-    final VaryingBPVReader vBPVReader;
-    // Scratch arrays for DISI traversal
-    final int[] indexScratch = new int[4096];
-    final boolean[] existsScratch = new boolean[4096];
-
-    SparseVaryingBPVDocValues(NumericEntry entry, IndexedDISI disi, RandomAccessInput slice)
-        throws IOException {
-      super(disi);
-      this.entry = entry;
-      this.slice = slice;
-      this.vBPVReader = new VaryingBPVReader(entry, slice);
-    }
-
-    @Override
-    public long longValue() throws IOException {
-      return vBPVReader.getLongValue(disi.index());
-    }
-
-    @Override
-    public void longValues(int size, int[] docs, long[] values, long defaultValue)
-        throws IOException {
-      if (!PrefetchConfig.isEnabled()) { super.longValues(size, docs, values, defaultValue); return; }
-      if (size == 0) return;
-
-      // Step 1: Compute density ratio for strategy selection
-      final boolean perDoc;
-      if (size == 1) {
-        perDoc = true;
-      } else {
-        long densityRatio = ((long) docs[size - 1] - docs[0]) / size;
-        // For DISI jump table: each entry is Integer.BYTES * 2 = 8 bytes = 64 bits
-        perDoc = usePerDocPrefetch(densityRatio, Integer.BYTES * 2 * 8, 1);
-      }
-
-      // Step 2: DISI prefetch (density-aware) using shared helper
-      prefetchDISI(size, docs, 0, perDoc);
-
-      // Step 3: Traverse DISI for each doc: record existence and index
-      int[] idxScratch = size <= indexScratch.length ? indexScratch : new int[size];
-      boolean[] exScratch = size <= existsScratch.length ? existsScratch : new boolean[size];
-      traverseDISI(size, docs, 0, idxScratch, exScratch);
-
-      // Step 4: Two-round rankSlice prefetch using DISI indices for block range
-      final int shift = vBPVReader.shift;
-      final RandomAccessInput rankSlice = vBPVReader.rankSlice;
-
-      // Find first and last existing indices for value prefetch range
-      int firstExisting = -1;
-      int lastExisting = -1;
-      for (int i = 0; i < size; i++) {
-        if (exScratch[i]) {
-          if (firstExisting == -1) firstExisting = i;
-          lastExisting = i;
-        }
-      }
-
-      if (firstExisting >= 0 && rankSlice != null) {
-        final long firstIndex = Integer.toUnsignedLong(idxScratch[firstExisting]);
-        final long lastIndex = Integer.toUnsignedLong(idxScratch[lastExisting]);
-        final long firstValueBlock = firstIndex >>> shift;
-        final long lastValueBlock = lastIndex >>> shift;
-
-        if (perDoc) {
-          // Per-doc strategy: prefetch rankSlice entries per existing doc's block individually
-          // Round 1: prefetch rankSlice entries
-          long prevValueBlock = -1;
-          for (int i = 0; i < size; i++) {
-            if (exScratch[i]) {
-              long valueBlock = Integer.toUnsignedLong(idxScratch[i]) >>> shift;
-              if (valueBlock != prevValueBlock) {
-                rankSlice.prefetch(valueBlock * Long.BYTES, Long.BYTES);
-                prevValueBlock = valueBlock;
-              }
-            }
-          }
-
-          // Round 2: read rankSlice entries to get data offsets, prefetch value data blocks
-          prevValueBlock = -1;
-          for (int i = 0; i < size; i++) {
-            if (exScratch[i]) {
-              long valueBlock = Integer.toUnsignedLong(idxScratch[i]) >>> shift;
-              if (valueBlock != prevValueBlock) {
-                long blockStartOffset =
-                    rankSlice.readLong(valueBlock * Long.BYTES) - entry.valuesOffset;
-                int bitsPerValue = Byte.toUnsignedInt(slice.readByte(blockStartOffset));
-                if (bitsPerValue != 0) {
-                  int length = slice.readInt(blockStartOffset + 1 + Long.BYTES);
-                  slice.prefetch(blockStartOffset, 1 + Long.BYTES + Integer.BYTES + length);
-                } else {
-                  slice.prefetch(blockStartOffset, 1 + Long.BYTES);
-                }
-                prevValueBlock = valueBlock;
-              }
-            }
-          }
-        } else {
-          // Contiguous strategy: single prefetch for rankSlice range, then single prefetch for data
-          // Round 1: prefetch rankSlice entries for the block range
-          long rankFirstByte = firstValueBlock * Long.BYTES;
-          long rankLastByte = (lastValueBlock + 1) * Long.BYTES;
-          rankSlice.prefetch(rankFirstByte, rankLastByte - rankFirstByte);
-
-          // Round 2: read first and last block offsets to determine data range, then prefetch
-          long dataStartOffset =
-              rankSlice.readLong(firstValueBlock * Long.BYTES) - entry.valuesOffset;
-          long dataEndOffset =
-              rankSlice.readLong(lastValueBlock * Long.BYTES) - entry.valuesOffset;
-          // Read the last block's header to find its end
-          int lastBlockBpv = Byte.toUnsignedInt(slice.readByte(dataEndOffset));
-          long lastBlockEnd = dataEndOffset + 1 + Long.BYTES; // bpv byte + delta long
-          if (lastBlockBpv != 0) {
-            int length = slice.readInt(dataEndOffset + 1 + Long.BYTES);
-            lastBlockEnd += Integer.BYTES + length;
-          }
-          slice.prefetch(dataStartOffset, lastBlockEnd - dataStartOffset);
-        }
-      } else if (firstExisting >= 0) {
-        // No rankSlice: fall through to sequential reads below
-      }
-
-      // Step 5: Read values with VaryingBPVReader, fill defaultValue for missing docs
-      for (int i = 0; i < size; i++) {
-        if (exScratch[i]) {
-          values[i] = vBPVReader.getLongValue(idxScratch[i]);
-        } else {
-          values[i] = defaultValue;
-        }
-      }
-    }
   }
 
   private LongValues getDirectReaderInstance(
@@ -1399,47 +537,94 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     } else if (entry.docsWithFieldOffset == -1) {
       // dense
       if (entry.bitsPerValue == 0) {
-        return new DenseConstantDocValues(maxDoc, entry);
+        return new DenseNumericDocValues(maxDoc) {
+          @Override
+          public long longValue() throws IOException {
+            return entry.minValue;
+          }
+        };
       } else {
         final RandomAccessInput slice =
             data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+        // Prefetch the first page of data. Following pages are expected to get prefetched through
+        // read-ahead.
+        if (slice.length() > 0) {
+          slice.prefetch(0, 1);
+        }
         if (entry.blockShift >= 0) {
           // dense but split into blocks of different bits per value
-          return new DenseVaryingBPVDocValues(maxDoc, entry, slice);
+          return new DenseNumericDocValues(maxDoc) {
+            final VaryingBPVReader vBPVReader = new VaryingBPVReader(entry, slice);
+
+            @Override
+            public long longValue() throws IOException {
+              return vBPVReader.getLongValue(doc);
+            }
+
+            @Override
+            public void longValues(int size, int[] docs, long[] values, long defaultValue)
+                throws IOException {
+              if (PrefetchConfig.isEnabled() && size > 0) {
+                prefetchVaryingBPV(vBPVReader, size, docs);
+              }
+              super.longValues(size, docs, values, defaultValue);
+            }
+          };
         } else {
           final LongValues values =
               getDirectReaderInstance(slice, entry.bitsPerValue, 0L, entry.numValues);
           if (entry.table != null) {
-            return new DenseFixedBPVDocValues(
-                maxDoc,
-                entry,
-                slice,
-                values,
-                DenseFixedBPVDocValues.Encoding.TABLE,
-                entry.table,
-                0L,
-                0L);
+            final long[] table = entry.table;
+            return new DenseNumericDocValues(maxDoc) {
+              @Override
+              public long longValue() throws IOException {
+                return table[(int) values.get(doc)];
+              }
+
+          @Override
+          public void longValues(int size, int[] docs, long[] values, long defaultValue)
+              throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0 && entry.bitsPerValue > 0) {
+              prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
+            }
+            super.longValues(size, docs, values, defaultValue);
+          }
+            };
           } else if (entry.gcd == 1 && entry.minValue == 0) {
             // Common case for ordinals, which are encoded as numerics
-            return new DenseFixedBPVDocValues(
-                maxDoc,
-                entry,
-                slice,
-                values,
-                DenseFixedBPVDocValues.Encoding.PLAIN,
-                null,
-                1L,
-                0L);
+            return new DenseNumericDocValues(maxDoc) {
+              @Override
+              public long longValue() throws IOException {
+                return values.get(doc);
+              }
+
+          @Override
+          public void longValues(int size, int[] docs, long[] values, long defaultValue)
+              throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0 && entry.bitsPerValue > 0) {
+              prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
+            }
+            super.longValues(size, docs, values, defaultValue);
+          }
+            };
           } else {
-            return new DenseFixedBPVDocValues(
-                maxDoc,
-                entry,
-                slice,
-                values,
-                DenseFixedBPVDocValues.Encoding.GCD,
-                null,
-                entry.gcd,
-                entry.minValue);
+            final long mul = entry.gcd;
+            final long delta = entry.minValue;
+            return new DenseNumericDocValues(maxDoc) {
+              @Override
+              public long longValue() throws IOException {
+                return mul * values.get(doc) + delta;
+              }
+
+          @Override
+          public void longValues(int size, int[] docs, long[] values, long defaultValue)
+              throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0 && entry.bitsPerValue > 0) {
+              prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
+            }
+            super.longValues(size, docs, values, defaultValue);
+          }
+            };
           }
         }
       }
@@ -1454,46 +639,160 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               entry.denseRankPower,
               entry.numValues);
       if (entry.bitsPerValue == 0) {
-        return new SparseConstantDocValues(entry, disi);
+        return new SparseNumericDocValues(disi) {
+          @Override
+          public long longValue() throws IOException {
+            return entry.minValue;
+          }
+
+          @Override
+          public void longValues(int size, int[] docs, long[] values, long defaultValue)
+              throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0) {
+              prefetchDISI(disi, size, docs);
+            }
+            super.longValues(size, docs, values, defaultValue);
+          }
+        };
       } else {
         final RandomAccessInput slice =
             data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+        // Prefetch the first page of data. Following pages are expected to get prefetched through
+        // read-ahead.
+        if (slice.length() > 0) {
+          slice.prefetch(0, 1);
+        }
         if (entry.blockShift >= 0) {
           // sparse and split into blocks of different bits per value
-          return new SparseVaryingBPVDocValues(entry, disi, slice);
+          return new SparseNumericDocValues(disi) {
+            final VaryingBPVReader vBPVReader = new VaryingBPVReader(entry, slice);
+
+            @Override
+            public long longValue() throws IOException {
+              final int index = disi.index();
+              return vBPVReader.getLongValue(index);
+            }
+
+            @Override
+            public void longValues(int size, int[] docs, long[] vals, long defaultValue)
+                throws IOException {
+              if (!PrefetchConfig.isEnabled() || size == 0) { super.longValues(size, docs, vals, defaultValue); return; }
+              prefetchDISI(disi, size, docs);
+              // Two-pass: traverse DISI, prefetch rankSlice at DISI indices, then read
+              int[] indices = new int[size];
+              boolean[] exists = new boolean[size];
+              for (int i = 0; i < size; i++) {
+                exists[i] = disi.advanceExact(docs[i]);
+                if (exists[i]) indices[i] = disi.index();
+              }
+              // Prefetch varying BPV rankSlice using DISI indices as positions
+              int existCount = 0;
+              for (int i = 0; i < size; i++) if (exists[i]) existCount++;
+              if (existCount > 0) {
+                int[] compact = new int[existCount];
+                int idx = 0;
+                for (int i = 0; i < size; i++) if (exists[i]) compact[idx++] = indices[i];
+                prefetchVaryingBPV(vBPVReader, existCount, compact);
+              }
+              for (int i = 0; i < size; i++) {
+                vals[i] = exists[i] ? vBPVReader.getLongValue(indices[i]) : defaultValue;
+              }
+            }
+          };
         } else {
           final LongValues values =
               getDirectReaderInstance(slice, entry.bitsPerValue, 0L, entry.numValues);
           if (entry.table != null) {
-            return new SparseFixedBPVDocValues(
-                entry,
-                disi,
-                slice,
-                values,
-                SparseFixedBPVDocValues.Encoding.TABLE,
-                entry.table,
-                0L,
-                0L);
+            final long[] table = entry.table;
+            return new SparseNumericDocValues(disi) {
+              @Override
+              public long longValue() throws IOException {
+                return table[(int) values.get(disi.index())];
+              }
+
+              @Override
+              public void longValues(int size, int[] docs, long[] vals, long defaultValue)
+                  throws IOException {
+                if (!PrefetchConfig.isEnabled() || size == 0) { super.longValues(size, docs, vals, defaultValue); return; }
+                prefetchDISI(disi, size, docs);
+                // Two-pass: traverse DISI, prefetch value data, then read
+                int[] indices = new int[size];
+                boolean[] exists = new boolean[size];
+                for (int i = 0; i < size; i++) {
+                  exists[i] = disi.advanceExact(docs[i]);
+                  if (exists[i]) indices[i] = disi.index();
+                }
+                if (entry.bitsPerValue > 0) {
+                  int count = 0;
+                  int[] compact = new int[size];
+                  for (int i = 0; i < size; i++) if (exists[i]) compact[count++] = indices[i];
+                  if (count > 0) prefetchFixedBPV(count, compact, slice, entry.bitsPerValue);
+                }
+                for (int i = 0; i < size; i++) {
+                  vals[i] = exists[i] ? table[(int) values.get(indices[i])] : defaultValue;
+                }
+              }
+            };
           } else if (entry.gcd == 1 && entry.minValue == 0) {
-            return new SparseFixedBPVDocValues(
-                entry,
-                disi,
-                slice,
-                values,
-                SparseFixedBPVDocValues.Encoding.PLAIN,
-                null,
-                1L,
-                0L);
+            return new SparseNumericDocValues(disi) {
+              @Override
+              public long longValue() throws IOException {
+                return values.get(disi.index());
+              }
+
+              @Override
+              public void longValues(int size, int[] docs, long[] vals, long defaultValue)
+                  throws IOException {
+                if (!PrefetchConfig.isEnabled() || size == 0) { super.longValues(size, docs, vals, defaultValue); return; }
+                prefetchDISI(disi, size, docs);
+                int[] indices = new int[size];
+                boolean[] exists = new boolean[size];
+                for (int i = 0; i < size; i++) {
+                  exists[i] = disi.advanceExact(docs[i]);
+                  if (exists[i]) indices[i] = disi.index();
+                }
+                if (entry.bitsPerValue > 0) {
+                  int count = 0;
+                  int[] compact = new int[size];
+                  for (int i = 0; i < size; i++) if (exists[i]) compact[count++] = indices[i];
+                  if (count > 0) prefetchFixedBPV(count, compact, slice, entry.bitsPerValue);
+                }
+                for (int i = 0; i < size; i++) {
+                  vals[i] = exists[i] ? values.get(indices[i]) : defaultValue;
+                }
+              }
+            };
           } else {
-            return new SparseFixedBPVDocValues(
-                entry,
-                disi,
-                slice,
-                values,
-                SparseFixedBPVDocValues.Encoding.GCD,
-                null,
-                entry.gcd,
-                entry.minValue);
+            final long mul = entry.gcd;
+            final long delta = entry.minValue;
+            return new SparseNumericDocValues(disi) {
+              @Override
+              public long longValue() throws IOException {
+                return mul * values.get(disi.index()) + delta;
+              }
+
+              @Override
+              public void longValues(int size, int[] docs, long[] vals, long defaultValue)
+                  throws IOException {
+                if (!PrefetchConfig.isEnabled() || size == 0) { super.longValues(size, docs, vals, defaultValue); return; }
+                prefetchDISI(disi, size, docs);
+                int[] indices = new int[size];
+                boolean[] exists = new boolean[size];
+                for (int i = 0; i < size; i++) {
+                  exists[i] = disi.advanceExact(docs[i]);
+                  if (exists[i]) indices[i] = disi.index();
+                }
+                if (entry.bitsPerValue > 0) {
+                  int count = 0;
+                  int[] compact = new int[size];
+                  for (int i = 0; i < size; i++) if (exists[i]) compact[count++] = indices[i];
+                  if (count > 0) prefetchFixedBPV(count, compact, slice, entry.bitsPerValue);
+                }
+                for (int i = 0; i < size; i++) {
+                  vals[i] = exists[i] ? mul * values.get(indices[i]) + delta : defaultValue;
+                }
+              }
+            };
           }
         }
       }
@@ -1511,6 +810,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     } else {
       final RandomAccessInput slice =
           data.randomAccessSlice(entry.valuesOffset, entry.valuesLength);
+      // Prefetch the first page of data. Following pages are expected to get prefetched through
+      // read-ahead.
+      if (slice.length() > 0) {
+        slice.prefetch(0, 1);
+      }
       if (entry.blockShift >= 0) {
         return new LongValues() {
           final VaryingBPVReader vBPVReader = new VaryingBPVReader(entry, slice);
@@ -1656,6 +960,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     }
 
     final RandomAccessInput bytesSlice = data.randomAccessSlice(entry.dataOffset, entry.dataLength);
+    // Prefetch the first page of data. Following pages are expected to get prefetched through
+    // read-ahead.
+    if (bytesSlice.length() > 0) {
+      bytesSlice.prefetch(0, 1);
+    }
 
     if (entry.docsWithFieldOffset == -1) {
       // dense
@@ -1675,6 +984,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         // variable length
         final RandomAccessInput addressesData =
             this.data.randomAccessSlice(entry.addressesOffset, entry.addressesLength);
+        // Prefetch the first page of data. Following pages are expected to get prefetched through
+        // read-ahead.
+        if (addressesData.length() > 0) {
+          addressesData.prefetch(0, 1);
+        }
         final LongValues addresses =
             DirectMonotonicReader.getInstance(entry.addressesMeta, addressesData, merging);
         return new DenseBinaryDocValues(maxDoc) {
@@ -1715,6 +1029,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         // variable length
         final RandomAccessInput addressesData =
             this.data.randomAccessSlice(entry.addressesOffset, entry.addressesLength);
+        // Prefetch the first page of data. Following pages are expected to get prefetched through
+        // read-ahead.
+        if (addressesData.length() > 0) {
+          addressesData.prefetch(0, 1);
+        }
         final LongValues addresses =
             DirectMonotonicReader.getInstance(entry.addressesMeta, addressesData);
         return new SparseBinaryDocValues(disi) {
@@ -1751,6 +1070,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
       final RandomAccessInput slice =
           data.randomAccessSlice(ordsEntry.valuesOffset, ordsEntry.valuesLength);
+      // Prefetch the first page of data. Following pages are expected to get prefetched through
+      // read-ahead.
+      if (slice.length() > 0) {
+        slice.prefetch(0, 1);
+      }
       final LongValues values =
           getDirectReaderInstance(slice, ordsEntry.bitsPerValue, 0L, ordsEntry.numValues);
 
@@ -2045,7 +1369,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       if (ord < 0 || ord >= entry.termsDictSize) {
         throw new IndexOutOfBoundsException();
       }
-
       // Signed shift since ord is -1 when the terms enum is not positioned
       final long currentBlockIndex = this.ord >> TERMS_DICT_BLOCK_LZ4_SHIFT;
       final long blockIndex = ord >> TERMS_DICT_BLOCK_LZ4_SHIFT;
@@ -2237,6 +1560,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
     final RandomAccessInput addressesInput =
         data.randomAccessSlice(entry.addressesOffset, entry.addressesLength);
+    // Prefetch the first page of data. Following pages are expected to get prefetched through
+    // read-ahead.
+    if (addressesInput.length() > 0) {
+      addressesInput.prefetch(0, 1);
+    }
     final LongValues addresses =
         DirectMonotonicReader.getInstance(entry.addressesMeta, addressesInput, merging);
 
@@ -2396,11 +1724,21 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
       final RandomAccessInput addressesInput =
           data.randomAccessSlice(ordsEntry.addressesOffset, ordsEntry.addressesLength);
+      // Prefetch the first page of data. Following pages are expected to get prefetched through
+      // read-ahead.
+      if (addressesInput.length() > 0) {
+        addressesInput.prefetch(0, 1);
+      }
       final LongValues addresses =
           DirectMonotonicReader.getInstance(ordsEntry.addressesMeta, addressesInput);
 
       final RandomAccessInput slice =
           data.randomAccessSlice(ordsEntry.valuesOffset, ordsEntry.valuesLength);
+      // Prefetch the first page of data. Following pages are expected to get prefetched through
+      // read-ahead.
+      if (slice.length() > 0) {
+        slice.prefetch(0, 1);
+      }
       final LongValues values = DirectReader.getInstance(slice, ordsEntry.bitsPerValue);
 
       if (ordsEntry.docsWithFieldOffset == -1) { // dense
@@ -2623,6 +1961,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       if (rankSlice != null && rankSlice.length() > 0) {
         // Prefetch the first page of data. Following pages are expected to get prefetched through
         // read-ahead.
+        rankSlice.prefetch(0, 1);
       }
       shift = entry.blockShift;
       mul = entry.gcd;
@@ -2669,6 +2008,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     final DocValuesSkipperEntry entry = skippers.get(field.number);
 
     final IndexInput input = data.slice("doc value skipper", entry.offset, entry.length);
+    // Prefetch the first page of data. Following pages are expected to get prefetched through
+    // read-ahead.
+    if (input.length() > 0) {
+      input.prefetch(0, 1);
+    }
     // TODO: should we write to disk the actual max level for this segment?
     return new DocValuesSkipper() {
       final int[] minDocID = new int[SKIP_INDEX_MAX_LEVEL];
@@ -2694,8 +2038,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           }
         } else {
           // find next interval
-          assert target > maxDocID[0]
-              : "target " + target + " must be bigger that current interval " + maxDocID[0];
+          assert target > maxDocID[0] : "target must be bigger that current interval";
           while (true) {
             levels = input.readByte();
             assert levels <= SKIP_INDEX_MAX_LEVEL && levels > 0
@@ -2770,4 +2113,77 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       }
     };
   }
+
+
+  /**
+   * Prefetches DISI jump table and data blocks for a batch of doc IDs.
+   * This warms the cache for subsequent disi.advanceExact() calls.
+   */
+  static void prefetchDISI(IndexedDISI disi, int size, int[] docs) throws IOException {
+    if (disi.jumpTable == null || size == 0) return;
+    int firstBlock = docs[0] >>> 16;
+    int lastBlock = docs[size - 1] >>> 16;
+    int clampedFirst = Math.min(firstBlock, disi.jumpTableEntryCount - 1);
+    int clampedLast = Math.min(lastBlock, disi.jumpTableEntryCount - 1);
+    if (clampedFirst >= 0 && clampedLast >= clampedFirst) {
+      long jtFirstByte = (long) clampedFirst * Integer.BYTES * 2;
+      long jtLastByte = ((long) clampedLast + 1) * Integer.BYTES * 2;
+      disi.jumpTable.prefetch(jtFirstByte, jtLastByte - jtFirstByte);
+    }
+  }
+
+  /**
+   * Prefetches varying BPV rankSlice entries for a batch of positions.
+   * Positions are doc IDs for dense fields, DISI indices for sparse fields.
+   */
+  static void prefetchVaryingBPV(VaryingBPVReader vBPVReader, int size, int[] positions)
+      throws IOException {
+    if (vBPVReader.rankSlice == null || size == 0) return;
+    long firstBlock = Integer.toUnsignedLong(positions[0]) >>> vBPVReader.shift;
+    long lastBlock = Integer.toUnsignedLong(positions[size - 1]) >>> vBPVReader.shift;
+    long rankFirstByte = firstBlock * Long.BYTES;
+    long rankLastByte = (lastBlock + 1) * Long.BYTES;
+    vBPVReader.rankSlice.prefetch(rankFirstByte, rankLastByte - rankFirstByte);
+  }
+
+  // ---- Prefetch helpers (additive, no modifications to existing code) ----
+
+  /**
+   * Determines whether to use per-doc block-based prefetch or contiguous range prefetch.
+   * When docs are spread across more cache blocks than the batch size, per-doc is better.
+   */
+  static boolean usePerDocPrefetch(long densityRatio, int bitsPerValue, int densityMultiplier) {
+    if (bitsPerValue == 0) return false;
+    long blockCapacity = (32768L * 8) / bitsPerValue;
+    return densityRatio > blockCapacity * densityMultiplier;
+  }
+
+  /**
+   * Prefetches byte ranges for fixed bits-per-value encoded values. Computes byte offsets from
+   * positions and bitsPerValue, then calls slice.prefetch() using either a contiguous range or
+   * per-position strategy based on density.
+   */
+  static void prefetchFixedBPV(int size, int[] positions, RandomAccessInput slice, int bitsPerValue)
+      throws IOException {
+    assert size > 0;
+    assert bitsPerValue > 0;
+    int readSize = bitsPerValue <= 8 ? 1 : bitsPerValue <= 16 ? 2 : bitsPerValue <= 32 ? 4 : 8;
+    if (size == 1) {
+      long byteOffset = ((long) positions[0] * bitsPerValue) / 8;
+      slice.prefetch(byteOffset, readSize);
+    } else {
+      long densityRatio = ((long) positions[size - 1] - positions[0]) / size;
+      if (usePerDocPrefetch(densityRatio, bitsPerValue, 1)) {
+        for (int i = 0; i < size; i++) {
+          long byteOffset = ((long) positions[i] * bitsPerValue) / 8;
+          slice.prefetch(byteOffset, readSize);
+        }
+      } else {
+        long firstByte = ((long) positions[0] * bitsPerValue) / 8;
+        long lastByte = ((long) positions[size - 1] * bitsPerValue) / 8 + readSize;
+        slice.prefetch(firstByte, lastByte - firstByte);
+      }
+    }
+  }
+
 }
