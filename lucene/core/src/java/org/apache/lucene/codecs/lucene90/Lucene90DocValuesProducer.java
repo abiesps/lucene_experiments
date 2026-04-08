@@ -2141,9 +2141,19 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     if (vBPVReader.rankSlice == null || size == 0) return;
     long firstBlock = Integer.toUnsignedLong(positions[0]) >>> vBPVReader.shift;
     long lastBlock = Integer.toUnsignedLong(positions[size - 1]) >>> vBPVReader.shift;
+    // Round 1: prefetch rankSlice entries for the block range
     long rankFirstByte = firstBlock * Long.BYTES;
     long rankLastByte = (lastBlock + 1) * Long.BYTES;
     vBPVReader.rankSlice.prefetch(rankFirstByte, rankLastByte - rankFirstByte);
+    // Round 2: read rankSlice to get data offsets, prefetch value data range
+    long dataStartOffset = vBPVReader.rankSlice.readLong(firstBlock * Long.BYTES)
+        - vBPVReader.entry.valuesOffset;
+    long dataEndOffset = vBPVReader.rankSlice.readLong(lastBlock * Long.BYTES)
+        - vBPVReader.entry.valuesOffset;
+    if (dataEndOffset >= dataStartOffset) {
+      // Prefetch from first block's data to last block's data + estimated block size
+      vBPVReader.slice.prefetch(dataStartOffset, dataEndOffset - dataStartOffset + (1 << 13));
+    }
   }
 
   // ---- Prefetch helpers (additive, no modifications to existing code) ----

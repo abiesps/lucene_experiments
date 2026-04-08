@@ -63,10 +63,11 @@ public class TestLucene90DocValuesPrefetchCoverage extends LuceneTestCase {
       reads.add(offset);
     }
 
-    /** Assert every prefetched range contains at least one read. */
+    /** Assert every prefetched range contains at least one read, and reads are covered by prefetches. */
     void assertAllPrefetchesUsed(String fileName) {
       if (prefetches.isEmpty()) return;
 
+      // Check 1: No wasted prefetches — every prefetched range was read
       for (PrefetchedRange pf : prefetches) {
         boolean found = false;
         for (long readOffset : reads) {
@@ -85,6 +86,24 @@ public class TestLucene90DocValuesPrefetchCoverage extends LuceneTestCase {
                 + ") had no reads in range. Total reads: "
                 + reads.size(),
             found);
+      }
+
+      // Check 2: No missed prefetches — reads should be covered by prefetches
+      if (reads.size() > 10) {
+        int coveredReads = 0;
+        for (long readOffset : reads) {
+          for (PrefetchedRange pf : prefetches) {
+            if (readOffset >= pf.offset && readOffset < pf.offset + pf.length) {
+              coveredReads++;
+              break;
+            }
+          }
+        }
+        double ratio = (double) coveredReads / reads.size();
+        assertTrue(
+            "Low prefetch coverage in " + fileName + ": " + coveredReads + "/" + reads.size()
+                + " reads (" + String.format("%.1f%%", ratio * 100) + ") covered by prefetches",
+            ratio >= 0.3);
       }
     }
   }

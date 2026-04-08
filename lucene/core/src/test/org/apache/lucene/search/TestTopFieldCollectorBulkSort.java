@@ -18,6 +18,7 @@ package org.apache.lucene.search;
 
 import java.io.IOException;
 import org.apache.lucene.document.Document;
+import org.apache.lucene.document.FloatDocValuesField;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.index.DirectoryReader;
@@ -163,4 +164,130 @@ public class TestTopFieldCollectorBulkSort extends LuceneTestCase {
       w.forceMerge(1);
     }
   }
+
+  /** Sort by int field. */
+  public void testIntSort() throws Exception {
+    doTestSort(200000, 20, new Sort(new SortField("timestamp", SortField.Type.INT, true)));
+  }
+
+  /** Sort by float field. */
+  public void testFloatSort() throws Exception {
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(200001);
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < 200000; i++) {
+          Document doc = new Document();
+          doc.add(new FloatDocValuesField("fval", (float)(random().nextGaussian() * 1000)));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = new IndexSearcher(reader);
+        Sort sort = new Sort(new SortField("fval", SortField.Type.FLOAT, true));
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulk = searcher.search(new MatchAllDocsQuery(), 20, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDoc = searcher.search(new MatchAllDocsQuery(), 20, sort);
+        PrefetchConfig.setEnabled(true);
+        assertEquals(perDoc.scoreDocs.length, bulk.scoreDocs.length);
+        for (int i = 0; i < perDoc.scoreDocs.length; i++) {
+          assertEquals(perDoc.scoreDocs[i].doc, bulk.scoreDocs[i].doc);
+        }
+      }
+    }
+  }
+
+  /** Sort by double field. */
+  public void testDoubleSort() throws Exception {
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(200001);
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < 200000; i++) {
+          Document doc = new Document();
+          doc.add(new NumericDocValuesField("dval", Double.doubleToRawLongBits(random().nextGaussian() * 100000)));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = new IndexSearcher(reader);
+        Sort sort = new Sort(new SortField("dval", SortField.Type.DOUBLE, true));
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulk = searcher.search(new MatchAllDocsQuery(), 20, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDoc = searcher.search(new MatchAllDocsQuery(), 20, sort);
+        PrefetchConfig.setEnabled(true);
+        assertEquals(perDoc.scoreDocs.length, bulk.scoreDocs.length);
+        for (int i = 0; i < perDoc.scoreDocs.length; i++) {
+          assertEquals(perDoc.scoreDocs[i].doc, bulk.scoreDocs[i].doc);
+        }
+      }
+    }
+  }
+
+  /** Float edge cases: NaN, Infinity, -0.0. */
+  public void testFloatEdgeCases() throws Exception {
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        float[] edgeValues = {Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY,
+            -0.0f, 0.0f, Float.MIN_VALUE, Float.MAX_VALUE, -1.5f, 1.5f};
+        for (int i = 0; i < 10000; i++) {
+          Document doc = new Document();
+          float val = i < edgeValues.length ? edgeValues[i] : random().nextFloat() * 1000 - 500;
+          doc.add(new FloatDocValuesField("fval", val));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = new IndexSearcher(reader);
+        Sort sort = new Sort(new SortField("fval", SortField.Type.FLOAT, true));
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulk = searcher.search(new MatchAllDocsQuery(), 50, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDoc = searcher.search(new MatchAllDocsQuery(), 50, sort);
+        PrefetchConfig.setEnabled(true);
+        assertEquals(perDoc.scoreDocs.length, bulk.scoreDocs.length);
+        for (int i = 0; i < perDoc.scoreDocs.length; i++) {
+          assertEquals("doc mismatch at " + i, perDoc.scoreDocs[i].doc, bulk.scoreDocs[i].doc);
+        }
+      }
+    }
+  }
+
+  /** SearchAfter with float sort. */
+  public void testSearchAfterFloat() throws Exception {
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(200001);
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < 200000; i++) {
+          Document doc = new Document();
+          doc.add(new FloatDocValuesField("fval", random().nextFloat() * 10000));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = new IndexSearcher(reader);
+        Sort sort = new Sort(new SortField("fval", SortField.Type.FLOAT, true));
+        TopFieldDocs firstPage = searcher.search(new MatchAllDocsQuery(), 50, sort);
+        FieldDoc lastDoc = (FieldDoc) firstPage.scoreDocs[firstPage.scoreDocs.length - 1];
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulkPage = (TopFieldDocs) searcher.searchAfter(lastDoc, new MatchAllDocsQuery(), 50, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDocPage = (TopFieldDocs) searcher.searchAfter(lastDoc, new MatchAllDocsQuery(), 50, sort);
+        PrefetchConfig.setEnabled(true);
+        assertEquals(perDocPage.scoreDocs.length, bulkPage.scoreDocs.length);
+        for (int i = 0; i < perDocPage.scoreDocs.length; i++) {
+          assertEquals(perDocPage.scoreDocs[i].doc, bulkPage.scoreDocs[i].doc);
+        }
+      }
+    }
+  }
+
 }
