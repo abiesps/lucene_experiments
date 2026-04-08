@@ -144,7 +144,7 @@ class AssertingLeafCollector extends FilterLeafCollector {
 
     @Override
     public void forEach(int upTo, CheckedIntConsumer<IOException> consumer) throws IOException {
-      assert lastUpTo < upTo : "upTo=" + upTo + " but previous upTo=" + lastUpTo;
+      assert lastUpTo < upTo || (upTo == DocIdSetIterator.NO_MORE_DOCS && lastUpTo == DocIdSetIterator.NO_MORE_DOCS) : "upTo=" + upTo + " but previous upTo=" + lastUpTo;
       stream.forEach(
           doc -> {
             assert doc > lastCollected : "Out of order : " + lastCollected + " " + doc;
@@ -170,7 +170,7 @@ class AssertingLeafCollector extends FilterLeafCollector {
 
     @Override
     public int count(int upTo) throws IOException {
-      assert lastUpTo < upTo : "upTo=" + upTo + " but previous upTo=" + lastUpTo;
+      assert lastUpTo < upTo || (upTo == DocIdSetIterator.NO_MORE_DOCS && lastUpTo == DocIdSetIterator.NO_MORE_DOCS) : "upTo=" + upTo + " but previous upTo=" + lastUpTo;
       int count = stream.count(upTo);
       lastUpTo = upTo;
       if (upTo == DocIdSetIterator.NO_MORE_DOCS) {
@@ -190,7 +190,7 @@ class AssertingLeafCollector extends FilterLeafCollector {
 
     @Override
     public int intoArray(int upTo, int[] array) {
-      assert lastUpTo < upTo : "upTo=" + upTo + " but previous upTo=" + lastUpTo;
+      assert lastUpTo < upTo || (upTo == DocIdSetIterator.NO_MORE_DOCS && lastUpTo == DocIdSetIterator.NO_MORE_DOCS) : "upTo=" + upTo + " but previous upTo=" + lastUpTo;
       int count = stream.intoArray(upTo, array);
       for (int i = 0; i < count; i++) {
         assert array[i] > lastCollected : "Out of order : " + lastCollected + " " + array[i];

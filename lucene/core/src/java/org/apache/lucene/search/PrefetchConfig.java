@@ -42,7 +42,6 @@ public final class PrefetchConfig {
 
   private PrefetchConfig() {}
 
-  private static volatile boolean logged = false;
 
   /** Whether debug logging for prefetch is enabled. */
   private static volatile boolean debugEnabled = "true".equalsIgnoreCase(
@@ -50,10 +49,6 @@ public final class PrefetchConfig {
 
   /** Returns true if bulk prefetch is enabled. */
   public static boolean isEnabled() {
-    if (!logged) {
-      logged = true;
-      System.err.println("[PrefetchConfig] isEnabled()=" + enabled + " batchSize=" + batchSize + " debug=" + debugEnabled);
-    }
     return enabled;
   }
 
