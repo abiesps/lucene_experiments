@@ -19,6 +19,7 @@ package org.apache.lucene.search.comparators;
 
 import java.io.IOException;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.search.BulkValueComparator;
 import org.apache.lucene.search.LeafFieldComparator;
 import org.apache.lucene.search.Pruning;
 import org.apache.lucene.util.NumericUtils;
@@ -70,7 +71,11 @@ public class IntComparator extends NumericComparator<Integer> {
   }
 
   /** Leaf comparator for {@link IntComparator} that provides skipping functionality */
-  public class IntLeafComparator extends NumericLeafComparator {
+  public class IntLeafComparator extends NumericLeafComparator implements BulkValueComparator {
+
+    private long[] batchValues;
+    private int[] batchDocs;
+    private int batchCount;
 
     public IntLeafComparator(LeafReaderContext context) throws IOException {
       super(context);
@@ -114,6 +119,29 @@ public class IntComparator extends NumericComparator<Integer> {
     @Override
     protected long topAsComparableLong() {
       return topValue;
+    }
+
+    @Override
+    public void setBatch(long[] values, int[] docs, int count) {
+      this.batchValues = values;
+      this.batchDocs = docs;
+      this.batchCount = count;
+    }
+
+    @Override
+    public int compareBottomAt(int idx) {
+      return Integer.compare(bottom, (int) batchValues[idx]);
+    }
+
+    @Override
+    public void copyAt(int slot, int idx) throws IOException {
+      values[slot] = (int) batchValues[idx];
+      super.copy(slot, batchDocs[idx]);
+    }
+
+    @Override
+    public int compareTopAt(int idx) {
+      return Integer.compare(topValue, (int) batchValues[idx]);
     }
   }
 }

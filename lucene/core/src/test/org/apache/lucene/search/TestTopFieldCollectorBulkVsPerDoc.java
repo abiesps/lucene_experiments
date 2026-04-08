@@ -18,6 +18,7 @@ package org.apache.lucene.search;
 
 import java.io.IOException;
 import org.apache.lucene.document.Document;
+import org.apache.lucene.document.FloatDocValuesField;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.document.Field.Store;
@@ -107,7 +108,7 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
       int pageSize = 50;
 
       try (IndexReader reader = DirectoryReader.open(dir)) {
-        IndexSearcher searcher = newSearcher(reader, true, true, false);
+        IndexSearcher searcher = new IndexSearcher(reader);
 
         // First page
         TopFieldDocs firstPage = searcher.search(new MatchAllDocsQuery(), pageSize, sort);
@@ -159,7 +160,7 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
       }
 
       try (IndexReader reader = DirectoryReader.open(dir)) {
-        IndexSearcher searcher = newSearcher(reader, true, true, false);
+        IndexSearcher searcher = new IndexSearcher(reader);
 
         PrefetchConfig.setEnabled(true);
         TopFieldDocs bulkResults = searcher.search(new MatchAllDocsQuery(), 10, indexSort);
@@ -179,16 +180,26 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
 
       try (IndexReader reader = DirectoryReader.open(dir)) {
         // Use single-threaded searcher to ensure deterministic results
-        IndexSearcher searcher = newSearcher(reader, true, true, false);
+        IndexSearcher searcher = new IndexSearcher(reader);
 
         PrefetchConfig.setEnabled(true);
+        TopFieldCollector.bulkCollectCount.set(0);
+        TopFieldCollector.collectStreamCount.set(0);
         TopFieldDocs bulkResults = searcher.search(query, topN, sort);
+        int bulkCount = TopFieldCollector.bulkCollectCount.get();
 
         PrefetchConfig.setEnabled(false);
         TopFieldDocs perDocResults = searcher.search(query, topN, sort);
         PrefetchConfig.setEnabled(true);
 
         assertResultsMatch(sort.toString(), perDocResults, bulkResults);
+        // Only assert bulk path when DocIdStream was actually produced by the scorer.
+        // Some queries (with competitive iterators from missingValue/index sort) use per-doc collection.
+        int streamCount = TopFieldCollector.collectStreamCount.get();
+        if (streamCount > 0) {
+          assertTrue(sort + ": collect(DocIdStream) called " + streamCount + " times but bulk path not taken (bulkCollectCount=" + bulkCount + ")",
+              bulkCount > 0);
+        }
       }
     }
   }
@@ -350,7 +361,7 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
         w.forceMerge(1);
       }
       try (IndexReader reader = DirectoryReader.open(dir)) {
-        IndexSearcher searcher = newSearcher(reader, true, true, false);
+        IndexSearcher searcher = new IndexSearcher(reader);
         Sort sort = new Sort(new SortField("ndv", SortField.Type.LONG, true));
 
         PrefetchConfig.setEnabled(true);
@@ -377,7 +388,7 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
         w.forceMerge(1);
       }
       try (IndexReader reader = DirectoryReader.open(dir)) {
-        IndexSearcher searcher = newSearcher(reader, true, true, false);
+        IndexSearcher searcher = new IndexSearcher(reader);
         Sort sort = new Sort(new SortField("ndv", SortField.Type.LONG, true));
 
         PrefetchConfig.setEnabled(true);
@@ -401,7 +412,7 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
       int pageSize = 30;
 
       try (IndexReader reader = DirectoryReader.open(dir)) {
-        IndexSearcher searcher = newSearcher(reader, true, true, false);
+        IndexSearcher searcher = new IndexSearcher(reader);
 
         TopFieldDocs firstPage = searcher.search(new MatchAllDocsQuery(), pageSize, sort);
         FieldDoc lastDoc = (FieldDoc) firstPage.scoreDocs[firstPage.scoreDocs.length - 1];
@@ -438,6 +449,70 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
     doTestBulkVsPerDoc(new Sort(sortFields), topN, numDocs, query);
   }
 
+
+
+  // ---- Sort by different numeric types ----
+
+  /** Sort by int field descending. */
+  public void testIntSortDesc() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.INT, true)),
+        50, 200000, new MatchAllDocsQuery());
+  }
+
+  /** Sort by int field ascending. */
+  public void testIntSortAsc() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(new SortField("ndv", SortField.Type.INT, false)),
+        50, 200000, new MatchAllDocsQuery());
+  }
+
+  /** Sort by float field descending. */
+  public void testFloatSortDesc() throws Exception {
+    try (Directory dir = newDirectory()) {
+      indexDocsWithFloat(dir, 200000);
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = new IndexSearcher(reader);
+        Sort sort = new Sort(new SortField("float_val", SortField.Type.FLOAT, true));
+
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulk = searcher.search(new MatchAllDocsQuery(), 50, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDoc = searcher.search(new MatchAllDocsQuery(), 50, sort);
+        PrefetchConfig.setEnabled(true);
+
+        assertResultsMatch("floatDesc", perDoc, bulk);
+      }
+    }
+  }
+
+  /** Sort by double field descending. */
+  public void testDoubleSortDesc() throws Exception {
+    try (Directory dir = newDirectory()) {
+      indexDocsWithDouble(dir, 200000);
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = new IndexSearcher(reader);
+        Sort sort = new Sort(new SortField("double_val", SortField.Type.DOUBLE, true));
+
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulk = searcher.search(new MatchAllDocsQuery(), 50, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDoc = searcher.search(new MatchAllDocsQuery(), 50, sort);
+        PrefetchConfig.setEnabled(true);
+
+        assertResultsMatch("doubleDesc", perDoc, bulk);
+      }
+    }
+  }
+
+  /** Multi-field sort: int desc + long asc. */
+  public void testMultiFieldIntLong() throws Exception {
+    doTestBulkVsPerDoc(
+        new Sort(
+            new SortField("ndv", SortField.Type.INT, true),
+            new SortField("ndv2", SortField.Type.LONG, false)),
+        50, 200000, new MatchAllDocsQuery());
+  }
 
   // ---- Block boundary tests ----
   // These use doc counts that cross key boundaries in the bulk collection path.
@@ -483,7 +558,7 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
         w.forceMerge(1);
       }
       try (IndexReader reader = DirectoryReader.open(dir)) {
-        IndexSearcher searcher = newSearcher(reader, true, true, false);
+        IndexSearcher searcher = new IndexSearcher(reader);
         Sort sort = new Sort(new SortField("ndv", SortField.Type.LONG, true));
 
         PrefetchConfig.setEnabled(true);
@@ -529,6 +604,35 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
         ? new MatchAllDocsQuery()
         : new TermQuery(new Term("s", random().nextBoolean() ? "a" : "b"));
     doTestBulkVsPerDoc(new Sort(sortFields), topN, numDocs, query);
+  }
+
+
+  private void indexDocsWithFloat(Directory dir, int numDocs) throws IOException {
+    IndexWriterConfig conf = new IndexWriterConfig();
+    conf.setMaxBufferedDocs(Math.min(numDocs + 1, 500001));
+    try (IndexWriter w = new IndexWriter(dir, conf)) {
+      for (int i = 0; i < numDocs; i++) {
+        Document doc = new Document();
+        doc.add(new FloatDocValuesField("float_val", random().nextFloat() * 10000));
+        doc.add(new StringField("s", random().nextBoolean() ? "a" : "b", Store.NO));
+        w.addDocument(doc);
+      }
+      w.forceMerge(1);
+    }
+  }
+
+  private void indexDocsWithDouble(Directory dir, int numDocs) throws IOException {
+    IndexWriterConfig conf = new IndexWriterConfig();
+    conf.setMaxBufferedDocs(Math.min(numDocs + 1, 500001));
+    try (IndexWriter w = new IndexWriter(dir, conf)) {
+      for (int i = 0; i < numDocs; i++) {
+        Document doc = new Document();
+        doc.add(new NumericDocValuesField("double_val", Double.doubleToRawLongBits(random().nextDouble() * 100000)));
+        doc.add(new StringField("s", random().nextBoolean() ? "a" : "b", Store.NO));
+        w.addDocument(doc);
+      }
+      w.forceMerge(1);
+    }
   }
 
 }

@@ -38,6 +38,17 @@ import org.apache.lucene.search.comparators.NumericComparator;
  */
 public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
 
+  /**
+   * Counter for bulk collect(DocIdStream) invocations. Incremented each time the bulk path
+   * is taken (not the per-doc fallback). Used by tests to verify the bulk path was exercised.
+   * Reset by tests before each run. Package-private for test access.
+   */
+  static final java.util.concurrent.atomic.AtomicInteger bulkCollectCount =
+      new java.util.concurrent.atomic.AtomicInteger(0);
+  static final java.util.concurrent.atomic.AtomicInteger collectStreamCount =
+      new java.util.concurrent.atomic.AtomicInteger(0);
+
+
   // TODO: one optimization we could do is to pre-fill
   // the queue with sentinel value that guaranteed to
   // always compare lower than a real hit; this would
@@ -330,6 +341,7 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
 
             @Override
             public void collect(DocIdStream stream) throws IOException {
+              collectStreamCount.incrementAndGet();
               if (bulkValueComparator == null || !PrefetchConfig.isEnabled()) {
                 super.collect(stream); // default per-doc fallback
                 return;
@@ -341,6 +353,7 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
               for (int count = stream.intoArray(docBuffer);
                    count != 0;
                    count = stream.intoArray(docBuffer)) {
+                bulkCollectCount.incrementAndGet();
                 bulkDocValues.longValues(count, docBuffer, valueBuffer, bulkMissingValue);
                 bulkValueComparator.setBatch(valueBuffer, docBuffer, count);
                 for (int i = 0; i < count; i++) {
@@ -448,6 +461,7 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
               for (int count = stream.intoArray(docBuffer);
                    count != 0;
                    count = stream.intoArray(docBuffer)) {
+                bulkCollectCount.incrementAndGet();
                 bulkDocValues.longValues(count, docBuffer, valueBuffer, bulkMissingValue);
                 bulkValueComparator.setBatch(valueBuffer, docBuffer, count);
                 for (int i = 0; i < count; i++) {
