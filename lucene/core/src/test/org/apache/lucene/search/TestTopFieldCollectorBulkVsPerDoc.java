@@ -19,6 +19,7 @@ package org.apache.lucene.search;
 import java.io.IOException;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.FloatDocValuesField;
+import org.apache.lucene.document.IntPoint;
 import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.util.BytesRef;
@@ -28,6 +29,7 @@ import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.util.LuceneTestCase;
@@ -223,6 +225,64 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
       assertEquals(context + ": doc at " + i, fdExpected.doc, fdActual.doc);
       for (int f = 0; f < fdExpected.fields.length; f++) {
         assertEquals(context + ": field " + f + " at " + i, fdExpected.fields[f], fdActual.fields[f]);
+      }
+    }
+  }
+
+  /** Pick a random query type to exercise different DocIdStream implementations. */
+  private Query randomQuery() {
+    switch (random().nextInt(6)) {
+      case 0: return new MatchAllDocsQuery();
+      case 1: return new TermQuery(new Term("s", "a"));  // ~50% match
+      case 2: return new TermQuery(new Term("s", "b"));  // ~50% match
+      case 3: return IntPoint.newRangeQuery("point", 0, random().nextInt(10000)); // range
+      case 4: return new BooleanQuery.Builder()
+          .add(new TermQuery(new Term("s", "a")), BooleanClause.Occur.MUST)
+          .add(IntPoint.newRangeQuery("point", 0, 5000), BooleanClause.Occur.FILTER)
+          .build();
+      default: return new MatchAllDocsQuery();
+    }
+  }
+
+  /**
+   * Index docs with optional random deletes. When withDeletes=true, ~20% of docs
+   * are deleted and NoMergePolicy is used to keep deletes visible.
+   */
+  private void indexDocsWithOptions(Directory dir, int numDocs, boolean withKeyword,
+      boolean withDeletes) throws IOException {
+    IndexWriterConfig conf = new IndexWriterConfig();
+    conf.setMaxBufferedDocs(Math.min(numDocs + 1, 500001));
+    if (withDeletes) {
+      conf.setMergePolicy(NoMergePolicy.INSTANCE);
+    }
+    try (IndexWriter w = new IndexWriter(dir, conf)) {
+      for (int i = 0; i < numDocs; i++) {
+        Document doc = new Document();
+        doc.add(new NumericDocValuesField("ndv", random().nextInt(10000)));
+        doc.add(new NumericDocValuesField("ndv2", random().nextInt(5000)));
+        doc.add(new IntPoint("point", random().nextInt(10000)));
+        if (random().nextInt(10) > 0) {
+          doc.add(new NumericDocValuesField("ndv_sparse", random().nextLong()));
+        }
+        doc.add(new StringField("s", random().nextBoolean() ? "a" : "b", Store.NO));
+        if (withDeletes) {
+          doc.add(new StringField("del", i % 5 == 0 ? "yes" : "no", Store.NO));
+        }
+        if (withKeyword) {
+          doc.add(new SortedDocValuesField("keyword", new BytesRef(String.format("kw_%08d", random().nextInt(numDocs / 2)))));
+          doc.add(new SortedDocValuesField("keyword_low", new BytesRef("cat_" + random().nextInt(10))));
+          if (random().nextInt(10) > 0) {
+            doc.add(new SortedDocValuesField("keyword_sparse", new BytesRef("sp_" + random().nextInt(1000))));
+          }
+        }
+        w.addDocument(doc);
+      }
+      if (withDeletes) {
+        w.flush();
+        w.deleteDocuments(new Term("del", "yes"));
+      }
+      if (!withDeletes) {
+        w.forceMerge(1);
       }
     }
   }
@@ -773,18 +833,283 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
     }
   }
 
-  /** Randomized keyword sort — random cardinality, direction, topN, query. */
+  /** Randomized keyword sort — random field, direction, topN, query, deletes. */
   public void testKeywordSortRandomized() throws Exception {
-    String[] fields = {"keyword", "keyword_low", "keyword_sparse"};
-    String field = fields[random().nextInt(fields.length)];
-    boolean reverse = random().nextBoolean();
-    SortField sf = new SortField(field, SortField.Type.STRING, reverse);
-    if (field.equals("keyword_sparse") && random().nextBoolean()) {
-      sf.setMissingValue(random().nextBoolean() ? SortField.STRING_FIRST : SortField.STRING_LAST);
+    boolean withDeletes = random().nextBoolean();
+    try (Directory dir = newDirectory()) {
+      indexDocsWithOptions(dir, 200_000, true, withDeletes);
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = new IndexSearcher(reader);
+
+        String[] fields = {"keyword", "keyword_low", "keyword_sparse"};
+        String field = fields[random().nextInt(fields.length)];
+        boolean reverse = random().nextBoolean();
+        SortField sf = new SortField(field, SortField.Type.STRING, reverse);
+        if (field.equals("keyword_sparse") && random().nextBoolean()) {
+          sf.setMissingValue(random().nextBoolean() ? SortField.STRING_FIRST : SortField.STRING_LAST);
+        }
+        int topN = random().nextInt(1, 100);
+        Query query = randomQuery();
+        Sort sort = new Sort(sf);
+
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulkResults = searcher.search(query, topN, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDocResults = searcher.search(query, topN, sort);
+        PrefetchConfig.setEnabled(true);
+        assertResultsMatch("randomized keyword (deletes=" + withDeletes + ")", perDocResults, bulkResults);
+      }
     }
-    int topN = random().nextInt(1, 100);
-    Query query = random().nextBoolean() ? new MatchAllDocsQuery() : new TermQuery(new Term("s", "a"));
-    doTestKeywordSort(new Sort(sf), topN, 200_000, query);
+  }
+
+  // ==================== Gap coverage tests ====================
+
+  /** Gap 1: Multi-segment index — keyword sort across multiple segments (no force merge). */
+  public void testKeywordSortMultiSegment() throws Exception {
+    try (Directory dir = newDirectory()) {
+      // Create 4 segments by flushing between batches
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(10); // force frequent flushes
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < 200_000; i++) {
+          Document doc = new Document();
+          doc.add(new SortedDocValuesField("keyword", new BytesRef(String.format("kw_%08d", random().nextInt(100000)))));
+          doc.add(new NumericDocValuesField("ndv", random().nextInt(10000)));
+          doc.add(new StringField("s", random().nextBoolean() ? "a" : "b", Store.NO));
+          w.addDocument(doc);
+        }
+        // Do NOT force merge — keep multiple segments
+      }
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        assertTrue("Expected multiple segments, got " + reader.leaves().size(),
+            reader.leaves().size() > 1);
+        IndexSearcher searcher = new IndexSearcher(reader);
+
+        Sort sort = new Sort(new SortField("keyword", SortField.Type.STRING));
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulkResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDocResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+        PrefetchConfig.setEnabled(true);
+        assertResultsMatch("multi-segment keyword sort", perDocResults, bulkResults);
+      }
+    }
+  }
+
+  /** Gap 1b: Multi-segment numeric sort — verify existing path still works across segments. */
+  public void testNumericSortMultiSegment() throws Exception {
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(10);
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < 200_000; i++) {
+          Document doc = new Document();
+          doc.add(new NumericDocValuesField("ndv", random().nextInt(10000)));
+          doc.add(new StringField("s", random().nextBoolean() ? "a" : "b", Store.NO));
+          w.addDocument(doc);
+        }
+      }
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        assertTrue(reader.leaves().size() > 1);
+        IndexSearcher searcher = new IndexSearcher(reader);
+
+        Sort sort = new Sort(new SortField("ndv", SortField.Type.LONG));
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulkResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDocResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+        PrefetchConfig.setEnabled(true);
+        assertResultsMatch("multi-segment numeric sort", perDocResults, bulkResults);
+      }
+    }
+  }
+
+  /** Gap 2: Index with deleted documents — soft deletes affect doc IDs. */
+  public void testKeywordSortWithDeletedDocs() throws Exception {
+    try (Directory dir = newDirectory()) {
+      int numDocs = 200_000;
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(numDocs + 1);
+      conf.setMergePolicy(org.apache.lucene.index.NoMergePolicy.INSTANCE);
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < numDocs; i++) {
+          Document doc = new Document();
+          doc.add(new SortedDocValuesField("keyword", new BytesRef(String.format("kw_%08d", i % 50000))));
+          doc.add(new NumericDocValuesField("ndv", i));
+          doc.add(new StringField("s", i % 3 == 0 ? "delete_me" : "keep", Store.NO));
+          w.addDocument(doc);
+        }
+        w.flush();
+        // Delete ~33% of docs
+        w.deleteDocuments(new Term("s", "delete_me"));
+      }
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = new IndexSearcher(reader);
+        assertTrue("Expected deleted docs", reader.maxDoc() > reader.numDocs());
+
+        Sort sort = new Sort(new SortField("keyword", SortField.Type.STRING));
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulkResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDocResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+        PrefetchConfig.setEnabled(true);
+        assertResultsMatch("keyword sort with deleted docs", perDocResults, bulkResults);
+      }
+    }
+  }
+
+  /** Gap 2b: Numeric sort with deleted docs. */
+  public void testNumericSortWithDeletedDocs() throws Exception {
+    try (Directory dir = newDirectory()) {
+      int numDocs = 200_000;
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(numDocs + 1);
+      conf.setMergePolicy(org.apache.lucene.index.NoMergePolicy.INSTANCE);
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < numDocs; i++) {
+          Document doc = new Document();
+          doc.add(new NumericDocValuesField("ndv", random().nextInt(10000)));
+          doc.add(new StringField("s", i % 4 == 0 ? "delete_me" : "keep", Store.NO));
+          w.addDocument(doc);
+        }
+        w.flush();
+        w.deleteDocuments(new Term("s", "delete_me"));
+      }
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        assertTrue("Expected deleted docs", reader.maxDoc() > reader.numDocs());
+        IndexSearcher searcher = new IndexSearcher(reader);
+
+        Sort sort = new Sort(new SortField("ndv", SortField.Type.LONG, true));
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulkResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDocResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+        PrefetchConfig.setEnabled(true);
+        assertResultsMatch("numeric sort with deleted docs", perDocResults, bulkResults);
+      }
+    }
+  }
+
+  /** Gap 3: Very high cardinality keyword field — millions of unique terms. */
+  public void testKeywordSortHighCardinality() throws Exception {
+    try (Directory dir = newDirectory()) {
+      int numDocs = 300_000;
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(numDocs + 1);
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < numDocs; i++) {
+          Document doc = new Document();
+          // Each doc gets a unique keyword — max cardinality
+          doc.add(new SortedDocValuesField("keyword", new BytesRef(String.format("unique_%010d", i))));
+          doc.add(new StringField("s", "a", Store.NO));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = new IndexSearcher(reader);
+
+        Sort sort = new Sort(new SortField("keyword", SortField.Type.STRING));
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulkResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDocResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+        PrefetchConfig.setEnabled(true);
+        assertResultsMatch("high cardinality keyword sort", perDocResults, bulkResults);
+      }
+    }
+  }
+
+  /** Gap 4: Keyword sort with _score tiebreaker — disables bulk path, must fall back cleanly. */
+  public void testKeywordSortWithScoreTiebreaker() throws Exception {
+    try (Directory dir = newDirectory()) {
+      indexDocsWithKeyword(dir, 200_000);
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        IndexSearcher searcher = new IndexSearcher(reader);
+
+        // Sort by keyword, then by score — score requires needsScores=true which disables bulk
+        Sort sort = new Sort(
+            new SortField("keyword", SortField.Type.STRING),
+            SortField.FIELD_SCORE);
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulkResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDocResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+        PrefetchConfig.setEnabled(true);
+        assertResultsMatch("keyword sort with score tiebreaker", perDocResults, bulkResults);
+      }
+    }
+  }
+
+  /** Gap 5: Keyword sort with concurrent segment search (multiple threads). */
+  public void testKeywordSortConcurrentSegments() throws Exception {
+    try (Directory dir = newDirectory()) {
+      // Create multiple segments
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(10);
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < 200_000; i++) {
+          Document doc = new Document();
+          doc.add(new SortedDocValuesField("keyword", new BytesRef(String.format("kw_%08d", random().nextInt(50000)))));
+          doc.add(new StringField("s", random().nextBoolean() ? "a" : "b", Store.NO));
+          w.addDocument(doc);
+        }
+      }
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        assertTrue(reader.leaves().size() > 1);
+        // Use concurrent searcher with 4 threads
+        java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(4);
+        try {
+          IndexSearcher searcher = new IndexSearcher(reader, executor);
+
+          Sort sort = new Sort(new SortField("keyword", SortField.Type.STRING));
+          PrefetchConfig.setEnabled(true);
+          TopFieldDocs bulkResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+          PrefetchConfig.setEnabled(false);
+          TopFieldDocs perDocResults = searcher.search(new MatchAllDocsQuery(), 10, sort);
+          PrefetchConfig.setEnabled(true);
+          assertResultsMatch("concurrent keyword sort", perDocResults, bulkResults);
+        } finally {
+          executor.shutdown();
+          executor.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS);
+        }
+      }
+    }
+  }
+
+  /** Gap 6: Multi-segment + deleted docs + keyword sort — combined worst case. */
+  public void testKeywordSortMultiSegmentWithDeletes() throws Exception {
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(10);
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < 200_000; i++) {
+          Document doc = new Document();
+          doc.add(new SortedDocValuesField("keyword", new BytesRef(String.format("kw_%08d", random().nextInt(50000)))));
+          doc.add(new NumericDocValuesField("ndv", random().nextInt(10000)));
+          doc.add(new StringField("s", i % 5 == 0 ? "delete_me" : "keep", Store.NO));
+          w.addDocument(doc);
+        }
+        w.deleteDocuments(new Term("s", "delete_me"));
+        // Do NOT force merge — keep multiple segments with deletes
+      }
+      try (IndexReader reader = DirectoryReader.open(dir)) {
+        assertTrue(reader.leaves().size() > 1);
+        assertTrue(reader.numDeletedDocs() > 0);
+        IndexSearcher searcher = new IndexSearcher(reader);
+
+        // Multi-field sort: keyword + numeric
+        Sort sort = new Sort(
+            new SortField("keyword", SortField.Type.STRING),
+            new SortField("ndv", SortField.Type.LONG));
+        PrefetchConfig.setEnabled(true);
+        TopFieldDocs bulkResults = searcher.search(new MatchAllDocsQuery(), 20, sort);
+        PrefetchConfig.setEnabled(false);
+        TopFieldDocs perDocResults = searcher.search(new MatchAllDocsQuery(), 20, sort);
+        PrefetchConfig.setEnabled(true);
+        assertResultsMatch("multi-segment+deletes keyword+numeric sort", perDocResults, bulkResults);
+      }
+    }
   }
 
   private void indexDocsWithDouble(Directory dir, int numDocs) throws IOException {

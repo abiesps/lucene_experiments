@@ -27,6 +27,7 @@ import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.SortedDocValues;
+import org.apache.lucene.search.PrefetchConfig;
 import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.index.SortedNumericDocValues;
@@ -923,6 +924,149 @@ public class TestLucene90DocValuesBulkRead extends LuceneTestCase {
         w.forceMerge(1);
       }
       assertPrefetchRangeCorrectness(dir, numDocs);
+    }
+  }
+
+  // ==================== Edge case tests ====================
+
+  /** ordValues with PrefetchConfig disabled — must still produce correct results. */
+  public void testOrdValuesPrefetchDisabled() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, numDocs, i -> String.format("term_%08d", i % 50000), true);
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        LeafReader leaf = reader.leaves().get(0).reader();
+
+        // Ground truth
+        SortedDocValues sdv1 = leaf.getSortedDocValues("sorted");
+        int[] expected = new int[numDocs];
+        for (int i = 0; i < numDocs; i++) {
+          expected[i] = sdv1.advanceExact(i) ? sdv1.ordValue() : -1;
+        }
+
+        // Test with prefetch disabled
+        boolean wasEnabled = PrefetchConfig.isEnabled();
+        try {
+          PrefetchConfig.setEnabled(false);
+          SortedDocValues sdv2 = leaf.getSortedDocValues("sorted");
+          int[] docs = new int[numDocs];
+          for (int i = 0; i < numDocs; i++) docs[i] = i;
+          int[] actual = new int[numDocs];
+          sdv2.ordValues(numDocs, docs, actual, -1);
+          assertArrayEquals("ordValues with prefetch disabled", expected, actual);
+        } finally {
+          PrefetchConfig.setEnabled(wasEnabled);
+        }
+      }
+    }
+  }
+
+  /** longValues with PrefetchConfig disabled — must still produce correct results. */
+  public void testLongValuesPrefetchDisabled() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexNumericDocs(dir, numDocs, i -> (long) i * 7, true);
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        LeafReader leaf = reader.leaves().get(0).reader();
+
+        NumericDocValues ndv1 = leaf.getNumericDocValues("numeric");
+        long[] expected = new long[numDocs];
+        for (int i = 0; i < numDocs; i++) {
+          expected[i] = ndv1.advanceExact(i) ? ndv1.longValue() : -1;
+        }
+
+        boolean wasEnabled = PrefetchConfig.isEnabled();
+        try {
+          PrefetchConfig.setEnabled(false);
+          NumericDocValues ndv2 = leaf.getNumericDocValues("numeric");
+          int[] docs = new int[numDocs];
+          for (int i = 0; i < numDocs; i++) docs[i] = i;
+          long[] actual = new long[numDocs];
+          ndv2.longValues(numDocs, docs, actual, -1);
+          assertArrayEquals("longValues with prefetch disabled", expected, actual);
+        } finally {
+          PrefetchConfig.setEnabled(wasEnabled);
+        }
+      }
+    }
+  }
+
+  /** ordValues on empty batch (size=0) — must not throw. */
+  public void testOrdValuesEmptyBatch() throws Exception {
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, 100, i -> "term_" + i, true);
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        LeafReader leaf = reader.leaves().get(0).reader();
+        SortedDocValues sdv = leaf.getSortedDocValues("sorted");
+        int[] docs = new int[0];
+        int[] ords = new int[0];
+        sdv.ordValues(0, docs, ords, -1); // should not throw
+      }
+    }
+  }
+
+  /** ordValues on single doc — boundary case. */
+  public void testOrdValuesSingleDocBatch() throws Exception {
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, 200_000, i -> "term_" + (i % 1000), true);
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        LeafReader leaf = reader.leaves().get(0).reader();
+        SortedDocValues sdv1 = leaf.getSortedDocValues("sorted");
+        SortedDocValues sdv2 = leaf.getSortedDocValues("sorted");
+
+        // Single doc at various positions
+        for (int doc : new int[]{0, 1, 100, 65535, 65536, 100000, 199999}) {
+          sdv1.advanceExact(doc);
+          int expected = sdv1.ordValue();
+
+          int[] docs = {doc};
+          int[] ords = new int[1];
+          sdv2.ordValues(1, docs, ords, -1);
+          assertEquals("Single doc " + doc, expected, ords[0]);
+        }
+      }
+    }
+  }
+
+  /** prefetchRange on empty batch — must not throw. */
+  public void testPrefetchRangeEmptyBatch() throws Exception {
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        Document doc = new Document();
+        doc.add(new SortedNumericDocValuesField("sndv", 42L));
+        doc.add(new SortedNumericDocValuesField("sndv", 43L));
+        w.addDocument(doc);
+        w.forceMerge(1);
+      }
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        LeafReader leaf = reader.leaves().get(0).reader();
+        SortedNumericDocValues sndv = leaf.getSortedNumericDocValues("sndv");
+        sndv.prefetchRange(new int[0], 0); // should not throw
+      }
+    }
+  }
+
+  /** Sparse ordValues where ALL queried docs are missing — all should get defaultOrd. */
+  public void testOrdValuesAllMissing() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      // Only even docs have values
+      indexSortedDocs(dir, numDocs, i -> "term_" + (i % 1000), false);
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        LeafReader leaf = reader.leaves().get(0).reader();
+        SortedDocValues sdv = leaf.getSortedDocValues("sorted");
+
+        // Query only odd docs — none have values
+        int count = 0;
+        int[] docs = new int[numDocs / 2];
+        for (int i = 1; i < numDocs; i += 2) docs[count++] = i;
+        int[] ords = new int[count];
+        sdv.ordValues(count, docs, ords, -1);
+        for (int i = 0; i < count; i++) {
+          assertEquals("Odd doc " + docs[i] + " should be missing", -1, ords[i]);
+        }
+      }
     }
   }
 
