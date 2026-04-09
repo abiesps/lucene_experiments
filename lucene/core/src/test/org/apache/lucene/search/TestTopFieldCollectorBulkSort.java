@@ -41,22 +41,22 @@ public class TestTopFieldCollectorBulkSort extends LuceneTestCase {
 
   /** Sort by a single long field descending — the most common sort query pattern. */
   public void testDescSortSingleField() throws Exception {
-    doTestSort(5000, 10, new Sort(new SortField("timestamp", SortField.Type.LONG, true)));
+    doTestSort(50_000, 10, new Sort(new SortField("timestamp", SortField.Type.LONG, true)));
   }
 
   /** Sort by a single long field ascending. */
   public void testAscSortSingleField() throws Exception {
-    doTestSort(5000, 10, new Sort(new SortField("timestamp", SortField.Type.LONG, false)));
+    doTestSort(50_000, 10, new Sort(new SortField("timestamp", SortField.Type.LONG, false)));
   }
 
   /** Sort with larger topN to exercise more queue operations. */
   public void testSortLargeTopN() throws Exception {
-    doTestSort(5000, 500, new Sort(new SortField("timestamp", SortField.Type.LONG, true)));
+    doTestSort(50_000, 500, new Sort(new SortField("timestamp", SortField.Type.LONG, true)));
   }
 
   /** Sort with topN=1 — edge case where queue is always full after first hit. */
   public void testSortTopOne() throws Exception {
-    doTestSort(1000, 1, new Sort(new SortField("timestamp", SortField.Type.LONG, true)));
+    doTestSort(20_000, 1, new Sort(new SortField("timestamp", SortField.Type.LONG, true)));
   }
 
   /** Sort with many docs to exercise multiple DocIdStream batches. */
@@ -66,7 +66,7 @@ public class TestTopFieldCollectorBulkSort extends LuceneTestCase {
 
   /** Randomized sort test. */
   public void testSortRandomized() throws Exception {
-    int numDocs = 1000 + random().nextInt(10000);
+    int numDocs = 20_000 + random().nextInt(30000);
     int topN = 1 + random().nextInt(Math.min(numDocs, 500));
     boolean reverse = random().nextBoolean();
     doTestSort(numDocs, topN, new Sort(new SortField("timestamp", SortField.Type.LONG, reverse)));
@@ -75,7 +75,7 @@ public class TestTopFieldCollectorBulkSort extends LuceneTestCase {
   /** SearchAfter pagination — PagingFieldCollector path. */
   public void testSearchAfterPagination() throws Exception {
     try (Directory dir = newDirectory()) {
-      int numDocs = 3000;
+      int numDocs = 50_000;
       indexDocs(dir, numDocs);
 
       Sort sort = new Sort(new SortField("timestamp", SortField.Type.LONG, true));
@@ -235,7 +235,7 @@ public class TestTopFieldCollectorBulkSort extends LuceneTestCase {
       try (IndexWriter w = new IndexWriter(dir, conf)) {
         float[] edgeValues = {Float.NaN, Float.POSITIVE_INFINITY, Float.NEGATIVE_INFINITY,
             -0.0f, 0.0f, Float.MIN_VALUE, Float.MAX_VALUE, -1.5f, 1.5f};
-        for (int i = 0; i < 10000; i++) {
+        for (int i = 0; i < 50000; i++) {
           Document doc = new Document();
           float val = i < edgeValues.length ? edgeValues[i] : random().nextFloat() * 1000 - 500;
           doc.add(new FloatDocValuesField("fval", val));

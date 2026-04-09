@@ -183,35 +183,16 @@ public class TestTopFieldCollectorBulkVsPerDoc extends LuceneTestCase {
       indexDocs(dir, numDocs);
 
       try (IndexReader reader = DirectoryReader.open(dir)) {
-        // Use single-threaded searcher to ensure deterministic results
         IndexSearcher searcher = new IndexSearcher(reader);
 
         PrefetchConfig.setEnabled(true);
-        TopFieldCollector.bulkCollectCount.set(0);
-        TopFieldCollector.collectStreamCount.set(0);
         TopFieldDocs bulkResults = searcher.search(query, topN, sort);
-        int bulkCount = TopFieldCollector.bulkCollectCount.get();
 
         PrefetchConfig.setEnabled(false);
         TopFieldDocs perDocResults = searcher.search(query, topN, sort);
         PrefetchConfig.setEnabled(true);
 
         assertResultsMatch(sort.toString(), perDocResults, bulkResults);
-        // Only assert bulk path when DocIdStream was actually produced by the scorer.
-        // Some queries (with competitive iterators from missingValue/index sort) use per-doc collection.
-        // NOTE: When the Asserting codec wraps comparators, the instanceof checks in
-        // TopFieldCollector fail (the wrapper hides NumericLeafComparator/TermOrdValLeafComparator),
-        // so bulkValueComparator is null and the bulk path is correctly skipped. We only assert
-        // bulk was taken when we know the codec doesn't wrap comparators — which we can't
-        // determine here. So we log instead of hard-failing when bulk wasn't taken.
-        int streamCount = TopFieldCollector.collectStreamCount.get();
-        if (streamCount > 0 && bulkCount == 0) {
-          // This is expected when Asserting codec wraps the comparator — not a real failure.
-          // Log for debugging but don't fail.
-          System.out.println("NOTE: " + sort + ": collect(DocIdStream) called " + streamCount
-              + " times but bulk path not taken (bulkCollectCount=0). "
-              + "This is expected with Asserting codec wrapping.");
-        }
       }
     }
   }

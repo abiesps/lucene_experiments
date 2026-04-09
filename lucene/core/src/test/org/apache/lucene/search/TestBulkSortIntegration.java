@@ -116,21 +116,19 @@ public class TestBulkSortIntegration extends LuceneTestCase {
   /**
    * Run a sort query with bulk ON and OFF, assert:
    * 1. Correctness: results match exactly
-   * 2. Bulk path taken: bulkCollectCount > 0 (when DocIdStream is produced)
+   * 2. Bulk path taken: BulkCollectionTracker detects collect(DocIdStream) calls
    */
   private void assertBulkSort(Directory dir, Sort sort, Query query, int topN) throws Exception {
     try (IndexReader reader = DirectoryReader.open(dir)) {
       IndexSearcher searcher = new IndexSearcher(reader);
 
-      // Bulk path
+      // Bulk path with tracking
       PrefetchConfig.setEnabled(true);
-      TopFieldCollector.bulkCollectCount.set(0);
-      TopFieldCollector.collectStreamCount.set(0);
-      TopFieldDocs bulkResults = searcher.search(query, topN, sort);
-      int bulkCount = TopFieldCollector.bulkCollectCount.get();
-      int streamCount = TopFieldCollector.collectStreamCount.get();
+      BulkCollectionTracker tracker = new BulkCollectionTracker();
+      TopFieldDocs bulkResults = searcher.search(query,
+          tracker.wrap(new TopFieldCollectorManager(sort, topN, null, Integer.MAX_VALUE)));
 
-      // Per-doc path
+      // Per-doc path (no tracking needed)
       PrefetchConfig.setEnabled(false);
       TopFieldDocs perDocResults = searcher.search(query, topN, sort);
       PrefetchConfig.setEnabled(true);
@@ -148,11 +146,12 @@ public class TestBulkSortIntegration extends LuceneTestCase {
             expected.fields, actual.fields);
       }
 
-      // 2. Bulk path taken (only when stream was produced)
-      if (streamCount > 0) {
+      // 2. Bulk path taken
+      if (tracker.collectStreamCount() > 0) {
         assertTrue("Bulk path not taken for " + sort
-            + " (streamCount=" + streamCount + ", bulkCount=" + bulkCount + ")",
-            bulkCount > 0);
+            + " (streamCount=" + tracker.collectStreamCount()
+            + ", bulkCount=" + tracker.bulkCollectCount() + ")",
+            tracker.bulkCollectCount() > 0);
       }
     }
   }

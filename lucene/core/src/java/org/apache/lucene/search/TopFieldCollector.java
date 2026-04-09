@@ -40,17 +40,6 @@ import org.apache.lucene.search.comparators.TermOrdValComparator;
  */
 public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
 
-  /**
-   * Counter for bulk collect(DocIdStream) invocations. Incremented each time the bulk path
-   * is taken (not the per-doc fallback). Used by tests to verify the bulk path was exercised.
-   * Reset by tests before each run. Package-private for test access.
-   */
-  static final java.util.concurrent.atomic.AtomicInteger bulkCollectCount =
-      new java.util.concurrent.atomic.AtomicInteger(0);
-  static final java.util.concurrent.atomic.AtomicInteger collectStreamCount =
-      new java.util.concurrent.atomic.AtomicInteger(0);
-
-
   // TODO: one optimization we could do is to pre-fill
   // the queue with sentinel value that guaranteed to
   // always compare lower than a real hit; this would
@@ -69,9 +58,9 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
     final SortedDocValues bulkSortedDocValues;  // non-null for keyword sort
     final long bulkMissingValue;
     final int bulkMissingOrd;  // missing ordinal for keyword sort (-1 or Integer.MAX_VALUE)
-    int[] docBuffer;    // lazily allocated int[4096]
-    long[] valueBuffer; // lazily allocated long[4096]
-    int[] ordBuffer;    // lazily allocated int[4096] for keyword sort
+    int[] docBuffer;    // lazily allocated int[PrefetchConfig.getBatchSize()]
+    long[] valueBuffer; // lazily allocated long[PrefetchConfig.getBatchSize()]
+    int[] ordBuffer;    // lazily allocated int[PrefetchConfig.getBatchSize()] for keyword sort
 
     // Multi-field sort state — null for single-field sorts
     final boolean isMultiSort;
@@ -379,22 +368,21 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
 
             @Override
             public void collect(DocIdStream stream) throws IOException {
-              collectStreamCount.incrementAndGet();
               if (bulkValueComparator == null || !PrefetchConfig.isEnabled()) {
                 super.collect(stream); // default per-doc fallback
                 return;
               }
               if (docBuffer == null) {
-                docBuffer = new int[4096];
-                valueBuffer = new long[4096];
+                int batchSize = PrefetchConfig.getBatchSize();
+                docBuffer = new int[batchSize];
+                valueBuffer = new long[batchSize];
                 if (bulkSortedDocValues != null) {
-                  ordBuffer = new int[4096];
+                  ordBuffer = new int[batchSize];
                 }
               }
               for (int count = stream.intoArray(docBuffer);
                    count != 0;
                    count = stream.intoArray(docBuffer)) {
-                bulkCollectCount.incrementAndGet();
                 fetchBulkValues(count);
                 bulkValueComparator.setBatch(valueBuffer, docBuffer, count);
                 for (int i = 0; i < count; i++) {
@@ -496,16 +484,16 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
                 return;
               }
               if (docBuffer == null) {
-                docBuffer = new int[4096];
-                valueBuffer = new long[4096];
+                int batchSize = PrefetchConfig.getBatchSize();
+                docBuffer = new int[batchSize];
+                valueBuffer = new long[batchSize];
                 if (bulkSortedDocValues != null) {
-                  ordBuffer = new int[4096];
+                  ordBuffer = new int[batchSize];
                 }
               }
               for (int count = stream.intoArray(docBuffer);
                    count != 0;
                    count = stream.intoArray(docBuffer)) {
-                bulkCollectCount.incrementAndGet();
                 fetchBulkValues(count);
                 bulkValueComparator.setBatch(valueBuffer, docBuffer, count);
                 for (int i = 0; i < count; i++) {
