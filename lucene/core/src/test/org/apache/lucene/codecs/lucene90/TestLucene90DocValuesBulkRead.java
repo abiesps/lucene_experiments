@@ -26,6 +26,11 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SortedDocValues;
+import org.apache.lucene.document.SortedDocValuesField;
+import org.apache.lucene.document.SortedNumericDocValuesField;
+import org.apache.lucene.index.SortedNumericDocValues;
+import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.tests.util.TestUtil;
@@ -482,6 +487,444 @@ public class TestLucene90DocValuesBulkRead extends LuceneTestCase {
   }
 
   // ---- Helper methods ----
+
+  // ==================== SortedDocValues.ordValues() tests ====================
+
+  /** Index sorted doc values with the given string generator. Dense = all docs have values. */
+  private void indexSortedDocs(Directory dir, int numDocs, java.util.function.IntFunction<String> valueFunc, boolean allDocs)
+      throws IOException {
+    IndexWriterConfig conf = new IndexWriterConfig();
+    conf.setMaxBufferedDocs(numDocs + 1);
+    try (IndexWriter w = new IndexWriter(dir, conf)) {
+      for (int i = 0; i < numDocs; i++) {
+        Document doc = new Document();
+        if (allDocs || i % 2 == 0) {
+          doc.add(new SortedDocValuesField("sorted", new BytesRef(valueFunc.apply(i))));
+        }
+        w.addDocument(doc);
+      }
+      w.forceMerge(1);
+    }
+  }
+
+  /** Validate ordValues() matches per-doc advanceExact+ordValue for all batch patterns. */
+  private void assertOrdValuesMatchPerDoc(Directory dir, int numDocs, int defaultOrd) throws IOException {
+    try (DirectoryReader reader = DirectoryReader.open(dir)) {
+      assertEquals(1, reader.leaves().size());
+      LeafReader leaf = reader.leaves().get(0).reader();
+
+      // Ground truth via per-doc API
+      int[] expected = new int[numDocs];
+      {
+        SortedDocValues sdv = leaf.getSortedDocValues("sorted");
+        if (sdv == null) {
+          Arrays.fill(expected, defaultOrd);
+        } else {
+          for (int i = 0; i < numDocs; i++) {
+            expected[i] = sdv.advanceExact(i) ? sdv.ordValue() : defaultOrd;
+          }
+        }
+      }
+
+      // Pattern 1: Full batch
+      {
+        SortedDocValues sdv = leaf.getSortedDocValues("sorted");
+        if (sdv != null) {
+          int[] docs = new int[numDocs];
+          for (int i = 0; i < numDocs; i++) docs[i] = i;
+          int[] actual = new int[numDocs];
+          sdv.ordValues(numDocs, docs, actual, defaultOrd);
+          assertArrayEquals("Full batch ordValues mismatch", expected, actual);
+        }
+      }
+
+      // Pattern 2: Small batches (64 docs) — crosses block boundaries
+      {
+        SortedDocValues sdv = leaf.getSortedDocValues("sorted");
+        if (sdv != null) {
+          int batchSize = 64;
+          int[] docs = new int[batchSize];
+          int[] actual = new int[batchSize];
+          for (int start = 0; start < numDocs; start += batchSize) {
+            int count = Math.min(batchSize, numDocs - start);
+            for (int i = 0; i < count; i++) docs[i] = start + i;
+            sdv.ordValues(count, docs, actual, defaultOrd);
+            for (int i = 0; i < count; i++) {
+              assertEquals("Batch ordValues mismatch at doc " + (start + i), expected[start + i], actual[i]);
+            }
+          }
+        }
+      }
+
+      // Pattern 3: Scattered (every 7th doc) — tests sparse access pattern
+      {
+        SortedDocValues sdv = leaf.getSortedDocValues("sorted");
+        if (sdv != null && numDocs > 10) {
+          int count = 0;
+          int[] docs = new int[numDocs / 7 + 1];
+          for (int i = 0; i < numDocs; i += 7) docs[count++] = i;
+          int[] actual = new int[count];
+          sdv.ordValues(count, docs, actual, defaultOrd);
+          for (int i = 0; i < count; i++) {
+            assertEquals("Scattered ordValues mismatch at doc " + docs[i], expected[docs[i]], actual[i]);
+          }
+        }
+      }
+    }
+  }
+
+  /** Dense sorted doc values — 200K docs, many unique values (high BPV). */
+  public void testOrdValuesDenseHighCardinality() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, numDocs, i -> String.format("term_%08d", i % 50000), true);
+      assertOrdValuesMatchPerDoc(dir, numDocs, -1);
+    }
+  }
+
+  /** Dense sorted doc values — low cardinality (low BPV, few unique ordinals). */
+  public void testOrdValuesDenseLowCardinality() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, numDocs, i -> "cat_" + (i % 5), true);
+      assertOrdValuesMatchPerDoc(dir, numDocs, -1);
+    }
+  }
+
+  /** Sparse sorted doc values — only even docs have values. */
+  public void testOrdValuesSparse() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, numDocs, i -> String.format("val_%06d", i % 10000), false);
+      assertOrdValuesMatchPerDoc(dir, numDocs, -1);
+    }
+  }
+
+  /** Sparse sorted doc values — very sparse (every 100th doc). */
+  public void testOrdValuesVerySparse() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(numDocs + 1);
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < numDocs; i++) {
+          Document doc = new Document();
+          if (i % 100 == 0) {
+            doc.add(new SortedDocValuesField("sorted", new BytesRef("sparse_" + (i / 100))));
+          }
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      assertOrdValuesMatchPerDoc(dir, numDocs, -1);
+    }
+  }
+
+  /** Single unique value — constant ordinal (BPV=0). */
+  public void testOrdValuesSingleValue() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, numDocs, i -> "constant", true);
+      assertOrdValuesMatchPerDoc(dir, numDocs, -1);
+    }
+  }
+
+  /** Property test: random cardinality, random sparsity, 300K docs. */
+  public void testOrdValuesRandomProperty() throws Exception {
+    int numDocs = 300_000;
+    int cardinality = random().nextInt(1, 100000);
+    boolean allDocs = random().nextBoolean();
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, numDocs, i -> "rnd_" + (i % cardinality), allDocs);
+      assertOrdValuesMatchPerDoc(dir, numDocs, -1);
+    }
+  }
+
+  /** Default ordinal = Integer.MAX_VALUE (missingLast pattern). */
+  public void testOrdValuesMissingLast() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, numDocs, i -> "term_" + (i % 1000), false);
+      assertOrdValuesMatchPerDoc(dir, numDocs, Integer.MAX_VALUE);
+    }
+  }
+
+  // ==================== SortedDocValues.prepareSeekExact() + lookupOrd tests ====================
+
+  /**
+   * Validate that prepareSeekExact(ord) + lookupOrd(ord) returns the same BytesRef
+   * as lookupOrd(ord) alone, for all ordinals. This tests correctness — the prefetch
+   * must not corrupt the term dictionary state.
+   */
+  private void assertPrepareSeekExactCorrectness(Directory dir, int numDocs) throws IOException {
+    try (DirectoryReader reader = DirectoryReader.open(dir)) {
+      assertEquals(1, reader.leaves().size());
+      LeafReader leaf = reader.leaves().get(0).reader();
+
+      SortedDocValues sdv1 = leaf.getSortedDocValues("sorted");
+      SortedDocValues sdv2 = leaf.getSortedDocValues("sorted");
+      assertNotNull(sdv1);
+      assertNotNull(sdv2);
+
+      int valueCount = sdv1.getValueCount();
+      // Ground truth: lookupOrd without prepare
+      BytesRef[] expected = new BytesRef[valueCount];
+      for (int ord = 0; ord < valueCount; ord++) {
+        expected[ord] = BytesRef.deepCopyOf(sdv1.lookupOrd(ord));
+      }
+
+      // Test: prepareSeekExact + lookupOrd for every ordinal
+      for (int ord = 0; ord < valueCount; ord++) {
+        sdv2.prepareSeekExact(ord);
+        BytesRef actual = sdv2.lookupOrd(ord);
+        assertEquals("prepareSeekExact corrupted lookupOrd at ord=" + ord,
+            expected[ord], actual);
+      }
+    }
+  }
+
+  /** Dense sorted, high cardinality — many LZ4 blocks (64 terms per block). */
+  public void testPrepareSeekExactDenseHighCardinality() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      // 50K unique terms → ~781 LZ4 blocks (50000/64)
+      indexSortedDocs(dir, numDocs, i -> String.format("term_%08d", i % 50000), true);
+      assertPrepareSeekExactCorrectness(dir, numDocs);
+    }
+  }
+
+  /** Dense sorted, low cardinality — few blocks. */
+  public void testPrepareSeekExactDenseLowCardinality() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      // 5 unique terms → 1 LZ4 block
+      indexSortedDocs(dir, numDocs, i -> "cat_" + (i % 5), true);
+      assertPrepareSeekExactCorrectness(dir, numDocs);
+    }
+  }
+
+  /** Sparse sorted — tests that prepare works when DISI is involved. */
+  public void testPrepareSeekExactSparse() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, numDocs, i -> String.format("val_%06d", i % 10000), false);
+      assertPrepareSeekExactCorrectness(dir, numDocs);
+    }
+  }
+
+  /** Reverse order access — prepare for ord N, then ord N-1. Tests block re-seek. */
+  public void testPrepareSeekExactReverseOrder() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, numDocs, i -> String.format("term_%08d", i % 50000), true);
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        LeafReader leaf = reader.leaves().get(0).reader();
+        SortedDocValues sdv1 = leaf.getSortedDocValues("sorted");
+        SortedDocValues sdv2 = leaf.getSortedDocValues("sorted");
+        int valueCount = sdv1.getValueCount();
+
+        // Access in reverse — every prepare forces a new block seek
+        for (int ord = valueCount - 1; ord >= 0; ord--) {
+          BytesRef expected = BytesRef.deepCopyOf(sdv1.lookupOrd(ord));
+          sdv2.prepareSeekExact(ord);
+          BytesRef actual = sdv2.lookupOrd(ord);
+          assertEquals("Reverse access mismatch at ord=" + ord, expected, actual);
+        }
+      }
+    }
+  }
+
+  /** Random access pattern — prepare + lookupOrd in random order. */
+  public void testPrepareSeekExactRandomAccess() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, numDocs, i -> String.format("term_%08d", i % 50000), true);
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        LeafReader leaf = reader.leaves().get(0).reader();
+        SortedDocValues sdv1 = leaf.getSortedDocValues("sorted");
+        SortedDocValues sdv2 = leaf.getSortedDocValues("sorted");
+        int valueCount = sdv1.getValueCount();
+
+        // Build ground truth
+        BytesRef[] expected = new BytesRef[valueCount];
+        for (int ord = 0; ord < valueCount; ord++) {
+          expected[ord] = BytesRef.deepCopyOf(sdv1.lookupOrd(ord));
+        }
+
+        // Random access — 10K random lookups
+        for (int i = 0; i < 10_000; i++) {
+          int ord = random().nextInt(valueCount);
+          sdv2.prepareSeekExact(ord);
+          BytesRef actual = sdv2.lookupOrd(ord);
+          assertEquals("Random access mismatch at ord=" + ord, expected[ord], actual);
+        }
+      }
+    }
+  }
+
+  /** Batch prepare then batch lookupOrd — the intended usage pattern. */
+  public void testPrepareSeekExactBatchPattern() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexSortedDocs(dir, numDocs, i -> String.format("term_%08d", i % 50000), true);
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        LeafReader leaf = reader.leaves().get(0).reader();
+        SortedDocValues sdv1 = leaf.getSortedDocValues("sorted");
+        SortedDocValues sdv2 = leaf.getSortedDocValues("sorted");
+        int valueCount = sdv1.getValueCount();
+
+        // Build ground truth
+        BytesRef[] expected = new BytesRef[valueCount];
+        for (int ord = 0; ord < valueCount; ord++) {
+          expected[ord] = BytesRef.deepCopyOf(sdv1.lookupOrd(ord));
+        }
+
+        // Batch: prepare all, then lookupOrd all (sorted ascending)
+        int batchSize = 256;
+        for (int start = 0; start < valueCount; start += batchSize) {
+          int end = Math.min(start + batchSize, valueCount);
+          // Phase 1: prepare all
+          for (int ord = start; ord < end; ord++) {
+            sdv2.prepareSeekExact(ord);
+          }
+          // Phase 2: read all
+          for (int ord = start; ord < end; ord++) {
+            BytesRef actual = sdv2.lookupOrd(ord);
+            assertEquals("Batch mismatch at ord=" + ord, expected[ord], actual);
+          }
+        }
+      }
+    }
+  }
+
+  // ==================== SortedNumericDocValues.prefetchRange() tests ====================
+
+  /** Index multi-valued sorted numeric docs. Each doc gets 1-3 values. */
+  private void indexSortedNumericDocs(Directory dir, int numDocs, boolean allDocs)
+      throws IOException {
+    IndexWriterConfig conf = new IndexWriterConfig();
+    conf.setMaxBufferedDocs(numDocs + 1);
+    try (IndexWriter w = new IndexWriter(dir, conf)) {
+      for (int i = 0; i < numDocs; i++) {
+        Document doc = new Document();
+        if (allDocs || i % 2 == 0) {
+          int numValues = 1 + (i % 3); // 1, 2, or 3 values per doc
+          for (int j = 0; j < numValues; j++) {
+            doc.add(new SortedNumericDocValuesField("sndv", (long) i * 100 + j));
+          }
+        }
+        w.addDocument(doc);
+      }
+      w.forceMerge(1);
+    }
+  }
+
+  /**
+   * Validate that prefetchRange + normal iteration produces the same results
+   * as iteration without prefetchRange.
+   */
+  private void assertPrefetchRangeCorrectness(Directory dir, int numDocs) throws IOException {
+    try (DirectoryReader reader = DirectoryReader.open(dir)) {
+      assertEquals(1, reader.leaves().size());
+      LeafReader leaf = reader.leaves().get(0).reader();
+
+      // Ground truth: iterate without prefetchRange
+      long[][] expected = new long[numDocs][];
+      {
+        SortedNumericDocValues sndv = leaf.getSortedNumericDocValues("sndv");
+        for (int i = 0; i < numDocs; i++) {
+          if (sndv != null && sndv.advanceExact(i)) {
+            int count = sndv.docValueCount();
+            expected[i] = new long[count];
+            for (int j = 0; j < count; j++) {
+              expected[i][j] = sndv.nextValue();
+            }
+          } else {
+            expected[i] = null;
+          }
+        }
+      }
+
+      // Test: prefetchRange then iterate — full batch
+      {
+        SortedNumericDocValues sndv = leaf.getSortedNumericDocValues("sndv");
+        if (sndv != null) {
+          int[] docs = new int[numDocs];
+          for (int i = 0; i < numDocs; i++) docs[i] = i;
+          sndv.prefetchRange(docs, numDocs);
+          for (int i = 0; i < numDocs; i++) {
+            if (expected[i] != null) {
+              assertTrue("Doc " + i + " should exist", sndv.advanceExact(i));
+              assertEquals("Doc " + i + " value count", expected[i].length, sndv.docValueCount());
+              for (int j = 0; j < expected[i].length; j++) {
+                assertEquals("Doc " + i + " value " + j, expected[i][j], sndv.nextValue());
+              }
+            }
+          }
+        }
+      }
+
+      // Test: prefetchRange in 64-doc batches
+      {
+        SortedNumericDocValues sndv = leaf.getSortedNumericDocValues("sndv");
+        if (sndv != null) {
+          int batchSize = 64;
+          int[] docs = new int[batchSize];
+          for (int start = 0; start < numDocs; start += batchSize) {
+            int count = Math.min(batchSize, numDocs - start);
+            for (int i = 0; i < count; i++) docs[i] = start + i;
+            sndv.prefetchRange(docs, count);
+            for (int i = 0; i < count; i++) {
+              int doc = start + i;
+              if (expected[doc] != null) {
+                assertTrue(sndv.advanceExact(doc));
+                assertEquals(expected[doc].length, sndv.docValueCount());
+                for (int j = 0; j < expected[doc].length; j++) {
+                  assertEquals(expected[doc][j], sndv.nextValue());
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /** Dense multi-valued sorted numeric — 200K docs, 1-3 values each. */
+  public void testPrefetchRangeDenseMultiValued() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexSortedNumericDocs(dir, numDocs, true);
+      assertPrefetchRangeCorrectness(dir, numDocs);
+    }
+  }
+
+  /** Sparse multi-valued sorted numeric — only even docs have values. */
+  public void testPrefetchRangeSparseMultiValued() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      indexSortedNumericDocs(dir, numDocs, false);
+      assertPrefetchRangeCorrectness(dir, numDocs);
+    }
+  }
+
+  /** Single-valued sorted numeric — should delegate to NumericDocValues path. */
+  public void testPrefetchRangeSingleValued() throws Exception {
+    int numDocs = 200_000;
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(numDocs + 1);
+      try (IndexWriter w = new IndexWriter(dir, conf)) {
+        for (int i = 0; i < numDocs; i++) {
+          Document doc = new Document();
+          doc.add(new SortedNumericDocValuesField("sndv", (long) i * 7));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      assertPrefetchRangeCorrectness(dir, numDocs);
+    }
+  }
 
   @FunctionalInterface
   interface IntToLong {

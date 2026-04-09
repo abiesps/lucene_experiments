@@ -21,12 +21,14 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
+import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.ReaderUtil;
 import org.apache.lucene.search.FieldValueHitQueue.Entry;
 import org.apache.lucene.search.TotalHits.Relation;
 import org.apache.lucene.search.comparators.NumericComparator;
+import org.apache.lucene.search.comparators.TermOrdValComparator;
 
 /**
  * A {@link Collector} that sorts by {@link SortField} using {@link FieldComparator}s.
@@ -64,9 +66,12 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
     // Bulk collection state — null when bulk path is not available
     final BulkValueComparator bulkValueComparator;
     final NumericDocValues bulkDocValues;
+    final SortedDocValues bulkSortedDocValues;  // non-null for keyword sort
     final long bulkMissingValue;
+    final int bulkMissingOrd;  // missing ordinal for keyword sort (-1 or Integer.MAX_VALUE)
     int[] docBuffer;    // lazily allocated int[4096]
     long[] valueBuffer; // lazily allocated long[4096]
+    int[] ordBuffer;    // lazily allocated int[4096] for keyword sort
 
     // Multi-field sort state — null for single-field sorts
     final boolean isMultiSort;
@@ -105,14 +110,24 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
       LeafFieldComparator[] detectedComps = null;
       int[] detectedRevMul = null;
 
+      SortedDocValues detectedSdv = null;
+      int detectedMissingOrd = -1;
+
       if (!needsScores && !canSetMinScore) {
-        // Try single-field sort
+        // Try single-field numeric sort
         if (this.comparator instanceof BulkValueComparator bvc
                 && this.comparator instanceof NumericComparator<?>.NumericLeafComparator nlc) {
           detectedBvc = bvc;
           detectedDv = nlc.getDocValues();
           Object mv = sort.getSort()[0].getMissingValue();
           detectedMv = mv instanceof Number n ? n.longValue() : 0L;
+        }
+        // Try single-field keyword sort (TermOrdValComparator)
+        else if (this.comparator instanceof TermOrdValComparator.TermOrdValLeafComparator tolc
+                && this.comparator instanceof BulkValueComparator bvc) {
+          detectedBvc = bvc;
+          detectedSdv = tolc.getSortedDocValues();
+          detectedMissingOrd = tolc.getMissingOrd();
         }
         // Try multi-field sort (primary field must support bulk)
         else if (this.comparator instanceof MultiLeafFieldComparator mlfc) {
@@ -127,16 +142,39 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
             detectedComps = mlfc.getComparators();
             detectedRevMul = mlfc.getReverseMul();
             detectedFirstRevMul = mlfc.getFirstReverseMul();
+          } else if (first instanceof TermOrdValComparator.TermOrdValLeafComparator tolc
+                  && first instanceof BulkValueComparator bvc) {
+            detectedBvc = bvc;
+            detectedSdv = tolc.getSortedDocValues();
+            detectedMissingOrd = tolc.getMissingOrd();
+            detectedMulti = true;
+            detectedComps = mlfc.getComparators();
+            detectedRevMul = mlfc.getReverseMul();
+            detectedFirstRevMul = mlfc.getFirstReverseMul();
           }
         }
       }
       this.bulkValueComparator = detectedBvc;
       this.bulkDocValues = detectedDv;
+      this.bulkSortedDocValues = detectedSdv;
       this.bulkMissingValue = detectedMv;
+      this.bulkMissingOrd = detectedMissingOrd;
       this.isMultiSort = detectedMulti;
       this.allComparators = detectedComps;
       this.allReverseMul = detectedRevMul;
       this.firstReverseMul = detectedFirstRevMul;
+    }
+
+    /** Fetch values for the current batch of docs. Uses NumericDocValues or SortedDocValues. */
+    void fetchBulkValues(int count) throws IOException {
+      if (bulkSortedDocValues != null) {
+        bulkSortedDocValues.ordValues(count, docBuffer, ordBuffer, -1);
+        for (int i = 0; i < count; i++) {
+          valueBuffer[i] = ordBuffer[i];
+        }
+      } else {
+        bulkDocValues.longValues(count, docBuffer, valueBuffer, bulkMissingValue);
+      }
     }
 
     void countHit() throws IOException {
@@ -349,12 +387,15 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
               if (docBuffer == null) {
                 docBuffer = new int[4096];
                 valueBuffer = new long[4096];
+                if (bulkSortedDocValues != null) {
+                  ordBuffer = new int[4096];
+                }
               }
               for (int count = stream.intoArray(docBuffer);
                    count != 0;
                    count = stream.intoArray(docBuffer)) {
                 bulkCollectCount.incrementAndGet();
-                bulkDocValues.longValues(count, docBuffer, valueBuffer, bulkMissingValue);
+                fetchBulkValues(count);
                 bulkValueComparator.setBatch(valueBuffer, docBuffer, count);
                 for (int i = 0; i < count; i++) {
                   countHit();
@@ -457,12 +498,15 @@ public abstract class TopFieldCollector extends TopDocsCollector<Entry> {
               if (docBuffer == null) {
                 docBuffer = new int[4096];
                 valueBuffer = new long[4096];
+                if (bulkSortedDocValues != null) {
+                  ordBuffer = new int[4096];
+                }
               }
               for (int count = stream.intoArray(docBuffer);
                    count != 0;
                    count = stream.intoArray(docBuffer)) {
                 bulkCollectCount.incrementAndGet();
-                bulkDocValues.longValues(count, docBuffer, valueBuffer, bulkMissingValue);
+                fetchBulkValues(count);
                 bulkValueComparator.setBatch(valueBuffer, docBuffer, count);
                 for (int i = 0; i < count; i++) {
                   countHit();

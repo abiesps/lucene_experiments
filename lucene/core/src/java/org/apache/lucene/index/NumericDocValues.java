@@ -36,8 +36,32 @@ public abstract class NumericDocValues extends DocValuesIterator {
   public abstract long longValue() throws IOException;
 
   /**
-   * Bulk retrieval of numeric doc values. This API helps reduce the performance impact of virtual
-   * function calls.
+   * Bulk retrieval of numeric doc values with prefetch support. This API serves two purposes:
+   * (1) reduces virtual function call overhead by batching, and (2) enables codec implementations
+   * to prefetch the underlying packed integer data before reading, so that cache misses are
+   * resolved asynchronously rather than blocking the calling thread.
+   *
+   * <p><b>Recommended usage — sort queries (TopFieldCollector):</b>
+   * <pre>{@code
+   * // Collect a batch of doc IDs from DocIdStream
+   * int count = stream.intoArray(docBuffer);  // up to 4096 docs
+   * // Prefetch + read all values in one call
+   * numericDocValues.longValues(count, docBuffer, valueBuffer, missingValue);
+   * // Compare and collect using pre-fetched values — zero IO
+   * for (int i = 0; i < count; i++) {
+   *     if (Long.compare(bottom, valueBuffer[i]) > 0) { ... }
+   * }
+   * }</pre>
+   *
+   * <p><b>Recommended usage — aggregations:</b>
+   * <pre>{@code
+   * // Batch docs from the collector
+   * numericDocValues.longValues(batchSize, docs, values, 0L);
+   * // Aggregate using pre-fetched values
+   * for (int i = 0; i < batchSize; i++) {
+   *     histogram.collect(values[i]);
+   * }
+   * }</pre>
    *
    * <p>This API behaves as if implemented as below, which is the default implementation:
    *

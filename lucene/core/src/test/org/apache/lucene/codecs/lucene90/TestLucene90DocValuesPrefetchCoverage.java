@@ -29,6 +29,11 @@ import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SortedDocValues;
+import org.apache.lucene.document.SortedDocValuesField;
+import org.apache.lucene.document.SortedNumericDocValuesField;
+import org.apache.lucene.index.SortedNumericDocValues;
+import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FilterDirectory;
 import org.apache.lucene.store.FilterIndexInput;
@@ -411,4 +416,207 @@ public class TestLucene90DocValuesPrefetchCoverage extends LuceneTestCase {
     doTestPrefetchCoverage(100000, i -> (long) i * 31, false);
   }
 
+  // ==================== SortedDocValues prefetch coverage ====================
+
+  private void doTestSortedPrefetchCoverage(int numDocs, java.util.function.IntFunction<String> valueFunc, boolean allDocs)
+      throws IOException {
+    try (Directory baseDir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(Math.min(numDocs + 1, 500001));
+      try (IndexWriter w = new IndexWriter(baseDir, conf)) {
+        for (int i = 0; i < numDocs; i++) {
+          Document doc = new Document();
+          if (allDocs || i % 2 == 0) {
+            doc.add(new SortedDocValuesField("sorted", new BytesRef(valueFunc.apply(i))));
+          }
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+
+      try (PrefetchTrackingDirectory trackingDir = new PrefetchTrackingDirectory(baseDir)) {
+        try (DirectoryReader reader = DirectoryReader.open(trackingDir)) {
+          LeafReader leaf = reader.leaves().get(0).reader();
+          SortedDocValues sdv = leaf.getSortedDocValues("sorted");
+          assertNotNull(sdv);
+
+          int[] docs = new int[numDocs];
+          for (int i = 0; i < numDocs; i++) docs[i] = i;
+          int[] ords = new int[numDocs];
+          sdv.ordValues(numDocs, docs, ords, -1);
+
+          // Every prefetched range must have been read — no wasted prefetches
+          trackingDir.assertAllPrefetchesUsed();
+
+          if (VERBOSE) {
+            System.out.println("Sorted prefetch coverage: " + trackingDir.totalPrefetches()
+                + " prefetches, all used, numDocs=" + numDocs);
+          }
+        }
+      }
+    }
+  }
+
+  /** Dense sorted, high cardinality — many unique ordinals, high BPV. */
+  public void testSortedPrefetchDenseHighCardinality() throws Exception {
+    doTestSortedPrefetchCoverage(200_000, i -> String.format("term_%08d", i % 50000), true);
+  }
+
+  /** Dense sorted, low cardinality — few unique ordinals, low BPV. */
+  public void testSortedPrefetchDenseLowCardinality() throws Exception {
+    doTestSortedPrefetchCoverage(200_000, i -> "cat_" + (i % 5), true);
+  }
+
+  /** Sparse sorted — only even docs have values. Tests DISI + ordinal prefetch. */
+  public void testSortedPrefetchSparse() throws Exception {
+    doTestSortedPrefetchCoverage(200_000, i -> String.format("val_%06d", i % 10000), false);
+  }
+
+  /** Dense sorted, single value — BPV=0 constant ordinal. */
+  public void testSortedPrefetchConstant() throws Exception {
+    doTestSortedPrefetchCoverage(200_000, i -> "constant", true);
+  }
+
+  /** Large dense sorted — 500K docs to cross multiple DISI and BPV blocks. */
+  public void testSortedPrefetchLargeDense() throws Exception {
+    doTestSortedPrefetchCoverage(500_000, i -> String.format("big_%010d", i % 200000), true);
+  }
+
+  // ==================== prepareSeekExact prefetch coverage ====================
+
+  /**
+   * Validate that prepareSeekExact issues prefetch calls that cover the bytes
+   * subsequently read by lookupOrd. Zero wasted prefetches.
+   */
+  private void doTestPrepareSeekExactPrefetchCoverage(int numDocs, int numUniqueTerms, boolean allDocs)
+      throws IOException {
+    try (Directory baseDir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(Math.min(numDocs + 1, 500001));
+      try (IndexWriter w = new IndexWriter(baseDir, conf)) {
+        for (int i = 0; i < numDocs; i++) {
+          Document doc = new Document();
+          if (allDocs || i % 2 == 0) {
+            doc.add(new SortedDocValuesField("sorted",
+                new BytesRef(String.format("term_%08d", i % numUniqueTerms))));
+          }
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+
+      try (PrefetchTrackingDirectory trackingDir = new PrefetchTrackingDirectory(baseDir)) {
+        try (DirectoryReader reader = DirectoryReader.open(trackingDir)) {
+          LeafReader leaf = reader.leaves().get(0).reader();
+          SortedDocValues sdv = leaf.getSortedDocValues("sorted");
+          assertNotNull(sdv);
+          int valueCount = sdv.getValueCount();
+          assertTrue("Expected multiple terms, got " + valueCount, valueCount > 1);
+
+          // Phase 1: prepareSeekExact for all ordinals
+          for (int ord = 0; ord < valueCount; ord++) {
+            sdv.prepareSeekExact(ord);
+          }
+          // Phase 2: lookupOrd for all ordinals (reads the prefetched blocks)
+          for (int ord = 0; ord < valueCount; ord++) {
+            sdv.lookupOrd(ord);
+          }
+
+          // Every prefetched range must have been read
+          trackingDir.assertAllPrefetchesUsed();
+
+          if (VERBOSE) {
+            System.out.println("prepareSeekExact prefetch coverage: "
+                + trackingDir.totalPrefetches() + " prefetches, all used, "
+                + valueCount + " unique terms");
+          }
+        }
+      }
+    }
+  }
+
+  /** prepareSeekExact coverage — high cardinality (many LZ4 blocks). */
+  public void testPrepareSeekExactPrefetchHighCardinality() throws Exception {
+    // 50K terms → ~781 LZ4 blocks (64 terms per block)
+    doTestPrepareSeekExactPrefetchCoverage(200_000, 50_000, true);
+  }
+
+  /** prepareSeekExact coverage — low cardinality (single LZ4 block). */
+  public void testPrepareSeekExactPrefetchLowCardinality() throws Exception {
+    doTestPrepareSeekExactPrefetchCoverage(200_000, 5, true);
+  }
+
+  /** prepareSeekExact coverage — medium cardinality crossing block boundaries. */
+  public void testPrepareSeekExactPrefetchMediumCardinality() throws Exception {
+    // 500 terms → ~8 LZ4 blocks
+    doTestPrepareSeekExactPrefetchCoverage(200_000, 500, true);
+  }
+
+  // ==================== SortedNumericDocValues.prefetchRange() coverage ====================
+
+  private void doTestSortedNumericPrefetchCoverage(int numDocs, boolean allDocs, int maxValuesPerDoc)
+      throws IOException {
+    try (Directory baseDir = newDirectory()) {
+      IndexWriterConfig conf = new IndexWriterConfig();
+      conf.setMaxBufferedDocs(Math.min(numDocs + 1, 500001));
+      try (IndexWriter w = new IndexWriter(baseDir, conf)) {
+        for (int i = 0; i < numDocs; i++) {
+          Document doc = new Document();
+          if (allDocs || i % 2 == 0) {
+            int numValues = 1 + (i % maxValuesPerDoc);
+            for (int j = 0; j < numValues; j++) {
+              doc.add(new SortedNumericDocValuesField("sndv", (long) i * 100 + j));
+            }
+          }
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+
+      try (PrefetchTrackingDirectory trackingDir = new PrefetchTrackingDirectory(baseDir)) {
+        try (DirectoryReader reader = DirectoryReader.open(trackingDir)) {
+          LeafReader leaf = reader.leaves().get(0).reader();
+          SortedNumericDocValues sndv = leaf.getSortedNumericDocValues("sndv");
+          assertNotNull(sndv);
+
+          int[] docs = new int[numDocs];
+          for (int i = 0; i < numDocs; i++) docs[i] = i;
+          sndv.prefetchRange(docs, numDocs);
+
+          // Iterate all docs to read the prefetched data
+          for (int i = 0; i < numDocs; i++) {
+            if (sndv.advanceExact(i)) {
+              int count = sndv.docValueCount();
+              for (int j = 0; j < count; j++) {
+                sndv.nextValue();
+              }
+            }
+          }
+
+          // Every prefetched range must have been read
+          trackingDir.assertAllPrefetchesUsed();
+
+          if (VERBOSE) {
+            System.out.println("SortedNumeric prefetch coverage: "
+                + trackingDir.totalPrefetches() + " prefetches, all used");
+          }
+        }
+      }
+    }
+  }
+
+  /** Dense multi-valued — 200K docs, 1-3 values each. */
+  public void testSortedNumericPrefetchDenseMultiValued() throws Exception {
+    doTestSortedNumericPrefetchCoverage(200_000, true, 3);
+  }
+
+  /** Sparse multi-valued — only even docs. */
+  public void testSortedNumericPrefetchSparseMultiValued() throws Exception {
+    doTestSortedNumericPrefetchCoverage(200_000, false, 3);
+  }
+
+  /** Dense single-valued — should delegate to NumericDocValues singleton path. */
+  public void testSortedNumericPrefetchDenseSingleValued() throws Exception {
+    doTestSortedNumericPrefetchCoverage(200_000, true, 1);
+  }
 }

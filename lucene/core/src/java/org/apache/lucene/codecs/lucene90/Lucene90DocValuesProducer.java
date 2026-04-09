@@ -19,6 +19,7 @@ package org.apache.lucene.codecs.lucene90;
 import static org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat.SKIP_INDEX_JUMP_LENGTH_PER_LEVEL;
 import static org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat.SKIP_INDEX_MAX_LEVEL;
 import static org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat.TERMS_DICT_BLOCK_LZ4_SHIFT;
+import static org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat.TERMS_DICT_BLOCK_LZ4_SIZE;
 
 import java.io.IOException;
 import org.apache.lucene.codecs.CodecUtil;
@@ -1122,6 +1123,15 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           public int docIDRunEnd() throws IOException {
             return maxDoc;
           }
+
+          @Override
+          public void ordValues(int size, int[] docs, int[] ords, int defaultOrd)
+              throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0 && ordsEntry.bitsPerValue > 0) {
+              prefetchFixedBPV(size, docs, slice, ordsEntry.bitsPerValue);
+            }
+            super.ordValues(size, docs, ords, defaultOrd);
+          }
         };
       } else if (ordsEntry.docsWithFieldOffset >= 0) { // sparse but non-empty
         final IndexedDISI disi =
@@ -1174,6 +1184,32 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           public int docIDRunEnd() throws IOException {
             return disi.docIDRunEnd();
           }
+
+          @Override
+          public void ordValues(int size, int[] docs, int[] ords, int defaultOrd)
+              throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0) {
+              prefetchDISI(disi, size, docs);
+              if (ordsEntry.bitsPerValue > 0) {
+                // Two-pass: traverse DISI to find indices, prefetch value data, then read
+                int[] indices = new int[size];
+                boolean[] exists = new boolean[size];
+                for (int i = 0; i < size; i++) {
+                  exists[i] = disi.advanceExact(docs[i]);
+                  if (exists[i]) indices[i] = disi.index();
+                }
+                int count = 0;
+                int[] compact = new int[size];
+                for (int i = 0; i < size; i++) if (exists[i]) compact[count++] = indices[i];
+                if (count > 0) prefetchFixedBPV(count, compact, slice, ordsEntry.bitsPerValue);
+                for (int i = 0; i < size; i++) {
+                  ords[i] = exists[i] ? (int) values.get(indices[i]) : defaultOrd;
+                }
+                return;
+              }
+            }
+            super.ordValues(size, docs, ords, defaultOrd);
+          }
         };
       }
     }
@@ -1215,6 +1251,17 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       public int docIDRunEnd() throws IOException {
         return ords.docIDRunEnd();
       }
+
+      @Override
+      public void ordValues(int size, int[] docs, int[] ordsBuf, int defaultOrd)
+          throws IOException {
+        // Delegate to NumericDocValues.longValues() which already has prefetch
+        long[] longBuf = new long[size];
+        ords.longValues(size, docs, longBuf, defaultOrd);
+        for (int i = 0; i < size; i++) {
+          ordsBuf[i] = (int) longBuf[i];
+        }
+      }
     };
   }
 
@@ -1255,6 +1302,24 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     @Override
     public TermsEnum termsEnum() throws IOException {
       return new TermsDict(entry.termsDictEntry, data);
+    }
+
+    /**
+     * Prefetch the LZ4 term dictionary blocks for the given ordinals.
+     * Call this before a batch of lookupOrd() calls to warm the cache
+     * asynchronously. The ordinals must be sorted ascending.
+     */
+    void prefetchOrdinals(int[] ords, int count) throws IOException {
+      if (termsEnum instanceof TermsDict td) {
+        td.prefetchBlocks(ords, count);
+      }
+    }
+
+    @Override
+    public void prepareSeekExact(int ord) throws IOException {
+      if (termsEnum instanceof TermsDict td) {
+        td.prepareSeekExact(ord);
+      }
     }
   }
 
@@ -1516,6 +1581,65 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       }
     }
 
+    /**
+     * Prepare for a subsequent seekExact(ord) by prefetching the LZ4 block
+     * containing the given ordinal. This is the ordinal equivalent of
+     * TermsEnum.prepareSeekExact(BytesRef) — same two-phase pattern where
+     * prepare issues async IO and the subsequent seekExact finds data warm.
+     */
+    void prepareSeekExact(long ord) throws IOException {
+      if (ord < 0 || ord >= entry.termsDictSize) return;
+      final long blockIndex = ord >> TERMS_DICT_BLOCK_LZ4_SHIFT;
+      // Skip if we're already positioned in this block
+      final long currentBlockIndex = this.ord >> TERMS_DICT_BLOCK_LZ4_SHIFT;
+      if (this.ord >= 0 && blockIndex == currentBlockIndex && ord >= this.ord) return;
+      // Prefetch the LZ4 block
+      long blockStart = blockAddresses.get(blockIndex);
+      long totalBlocks = (entry.termsDictSize + TERMS_DICT_BLOCK_LZ4_SIZE - 1)
+          >>> TERMS_DICT_BLOCK_LZ4_SHIFT;
+      long blockEnd = (blockIndex + 1 < totalBlocks)
+          ? blockAddresses.get(blockIndex + 1)
+          : entry.termsDataLength;
+      if (blockEnd > blockStart) {
+        bytes.prefetch(blockStart, blockEnd - blockStart);
+      }
+    }
+
+    /**
+     * Prefetch the LZ4 term dictionary blocks that will be read by subsequent
+     * seekExact(ord) calls. Given a sorted array of ordinals, computes the unique
+     * block indices, looks up their byte addresses, and issues prefetch() calls
+     * on the underlying IndexInput.
+     *
+     * <p>This is 100% non-speculative: every prefetched block WILL be decompressed
+     * by the subsequent seekExact calls because the ordinals are known in advance.
+     */
+    void prefetchBlocks(int[] ords, int count) throws IOException {
+      if (count == 0) return;
+      // Compute unique block indices from ordinals (ords are sorted ascending)
+      long prevBlock = -1;
+      for (int i = 0; i < count; i++) {
+        long blockIndex = ((long) ords[i]) >> TERMS_DICT_BLOCK_LZ4_SHIFT;
+        if (blockIndex != prevBlock) {
+          long blockStart = blockAddresses.get(blockIndex);
+          // End address: start of next block, or end of terms data
+          long blockEnd;
+          long nextBlockIndex = blockIndex + 1;
+          long totalBlocks = (entry.termsDictSize + TERMS_DICT_BLOCK_LZ4_SIZE - 1)
+              >>> TERMS_DICT_BLOCK_LZ4_SHIFT;
+          if (nextBlockIndex < totalBlocks) {
+            blockEnd = blockAddresses.get(nextBlockIndex);
+          } else {
+            blockEnd = entry.termsDataLength;
+          }
+          if (blockEnd > blockStart) {
+            bytes.prefetch(blockStart, blockEnd - blockStart);
+          }
+          prevBlock = blockIndex;
+        }
+      }
+    }
+
     @Override
     public BytesRef term() throws IOException {
       return term;
@@ -1560,6 +1684,9 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
     final RandomAccessInput addressesInput =
         data.randomAccessSlice(entry.addressesOffset, entry.addressesLength);
+    // Capture values slice for prefetchRange — needed to prefetch value data
+    final RandomAccessInput valuesSlice = (entry.bitsPerValue > 0)
+        ? data.randomAccessSlice(entry.valuesOffset, entry.valuesLength) : null;
     // Prefetch the first page of data. Following pages are expected to get prefetched through
     // read-ahead.
     if (addressesInput.length() > 0) {
@@ -1626,6 +1753,22 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         @Override
         public int docIDRunEnd() throws IOException {
           return maxDoc;
+        }
+
+        @Override
+        public void prefetchRange(int[] docs, int size) throws IOException {
+          if (!PrefetchConfig.isEnabled() || size == 0) return;
+          // Prefetch address index (typically small, a few KB)
+          prefetchDirectMonotonicAll(addressesInput);
+          // Read addresses (now warm) to get value position range
+          long firstStart = addresses.get(docs[0]);
+          long lastEnd = addresses.get((long) docs[size - 1] + 1);
+          // Prefetch values data for positions [firstStart, lastEnd)
+          if (lastEnd > firstStart && valuesSlice != null && entry.bitsPerValue > 0) {
+            long firstByte = (firstStart * entry.bitsPerValue) / 8;
+            long lastByte = ((lastEnd - 1) * entry.bitsPerValue) / 8 + 8;
+            valuesSlice.prefetch(firstByte, Math.min(lastByte - firstByte, valuesSlice.length() - firstByte));
+          }
         }
       };
     } else {
@@ -1703,6 +1846,21 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         @Override
         public int docIDRunEnd() throws IOException {
           return disi.docIDRunEnd();
+        }
+
+        @Override
+        public void prefetchRange(int[] docs, int size) throws IOException {
+          if (!PrefetchConfig.isEnabled() || size == 0) return;
+          // Prefetch DISI blocks (does not advance the iterator)
+          prefetchDISI(disi, size, docs);
+          // Prefetch address index (small, prefetch all)
+          prefetchDirectMonotonicAll(addressesInput);
+          // For values, we can't know exact positions without advancing DISI
+          // (which would corrupt iterator state). Prefetch the entire values slice
+          // as a conservative bound — values slice is the packed integer data.
+          if (valuesSlice != null && valuesSlice.length() > 0 && entry.bitsPerValue > 0) {
+            valuesSlice.prefetch(0, valuesSlice.length());
+          }
         }
       };
     }
@@ -2173,6 +2331,17 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
    * positions and bitsPerValue, then calls slice.prefetch() using either a contiguous range or
    * per-position strategy based on density.
    */
+  /**
+   * Prefetch the DirectMonotonicReader's backing RandomAccessInput. The address index
+   * is typically small (a few KB) so we prefetch the entire slice rather than computing
+   * exact block boundaries. This ensures addresses.get(index) calls don't block on IO.
+   */
+  static void prefetchDirectMonotonicAll(RandomAccessInput input) throws IOException {
+    if (input.length() > 0) {
+      input.prefetch(0, input.length());
+    }
+  }
+
   static void prefetchFixedBPV(int size, int[] positions, RandomAccessInput slice, int bitsPerValue)
       throws IOException {
     assert size > 0;

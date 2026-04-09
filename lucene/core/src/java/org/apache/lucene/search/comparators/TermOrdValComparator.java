@@ -32,6 +32,7 @@ import org.apache.lucene.search.FieldComparator;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.LeafFieldComparator;
 import org.apache.lucene.search.Pruning;
+import org.apache.lucene.search.BulkValueComparator;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.BytesRefBuilder;
@@ -183,7 +184,8 @@ public class TermOrdValComparator extends FieldComparator<BytesRef> {
     return val1.compareTo(val2);
   }
 
-  private class TermOrdValLeafComparator implements LeafFieldComparator {
+  /** Leaf comparator for keyword sort with bulk value support. */
+  public class TermOrdValLeafComparator implements LeafFieldComparator, BulkValueComparator {
 
     /* Current reader's doc ord/values. */
     final SortedDocValues termsIndex;
@@ -314,6 +316,7 @@ public class TermOrdValComparator extends FieldComparator<BytesRef> {
         values[slot] = null;
       } else {
         assert ord >= 0;
+        termsIndex.prepareSeekExact(ord);
         if (tempBRs[slot] == null) {
           tempBRs[slot] = new BytesRefBuilder();
         }
@@ -457,6 +460,83 @@ public class TermOrdValComparator extends FieldComparator<BytesRef> {
       assert minOrd >= 0;
       assert maxOrd < termsIndex.getValueCount();
       competitiveState.update(minOrd, maxOrd);
+    }
+
+    // --- BulkValueComparator implementation ---
+    // Values in the batch are ordinals cast to long. missingOrd is used as defaultOrd.
+    private long[] batchValues;
+    private int[] batchDocs;
+    private int batchCount;
+
+    @Override
+    public void setBatch(long[] values, int[] docs, int count) {
+      this.batchValues = values;
+      this.batchDocs = docs;
+      this.batchCount = count;
+    }
+
+    @Override
+    public int compareBottomAt(int idx) throws IOException {
+      assert bottomSlot != -1;
+      int docOrd = (int) batchValues[idx];
+      if (docOrd == -1) {
+        docOrd = missingOrd;
+      }
+      if (bottomSameReader) {
+        return bottomOrd - docOrd;
+      } else if (bottomOrd >= docOrd) {
+        return 1;
+      } else {
+        return -1;
+      }
+    }
+
+    @Override
+    public void copyAt(int slot, int idx) throws IOException {
+      int ord = (int) batchValues[idx];
+      if (ord == -1) {
+        ords[slot] = missingOrd;
+        values[slot] = null;
+      } else {
+        assert ord >= 0;
+        // Prefetch the LZ4 term dictionary block before reading.
+        // This is async — the buffer pool starts loading the block while
+        // we set up the BytesRefBuilder. For the common case where multiple
+        // competitive docs share a block, the prefetch is a no-op (already warm).
+        termsIndex.prepareSeekExact(ord);
+        if (tempBRs[slot] == null) {
+          tempBRs[slot] = new BytesRefBuilder();
+        }
+        tempBRs[slot].copyBytes(termsIndex.lookupOrd(ord));
+        values[slot] = tempBRs[slot].get();
+        ords[slot] = ord;
+      }
+      readerGen[slot] = currentReaderGen;
+    }
+
+    @Override
+    public int compareTopAt(int idx) throws IOException {
+      int ord = (int) batchValues[idx];
+      if (ord == -1) {
+        ord = missingOrd;
+      }
+      if (topSameReader) {
+        return topOrd - ord;
+      } else if (ord <= topOrd) {
+        return 1;
+      } else {
+        return -1;
+      }
+    }
+
+    /** Returns the SortedDocValues used by this leaf comparator. */
+    public SortedDocValues getSortedDocValues() {
+      return termsIndex;
+    }
+
+    /** Returns the missing ordinal value. */
+    public int getMissingOrd() {
+      return missingOrd;
     }
 
     @Override
