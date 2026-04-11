@@ -563,12 +563,10 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             }
 
             @Override
-            public void longValues(int size, int[] docs, long[] values, long defaultValue)
-                throws IOException {
+            public void prefetchLongValues(int size, int[] docs) throws IOException {
               if (PrefetchConfig.isEnabled() && size > 0) {
                 prefetchVaryingBPV(vBPVReader, size, docs);
               }
-              super.longValues(size, docs, values, defaultValue);
             }
           };
         } else {
@@ -583,12 +581,10 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               }
 
           @Override
-          public void longValues(int size, int[] docs, long[] values, long defaultValue)
-              throws IOException {
+          public void prefetchLongValues(int size, int[] docs) throws IOException {
             if (PrefetchConfig.isEnabled() && size > 0 && entry.bitsPerValue > 0) {
               prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
             }
-            super.longValues(size, docs, values, defaultValue);
           }
             };
           } else if (entry.gcd == 1 && entry.minValue == 0) {
@@ -600,12 +596,10 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               }
 
           @Override
-          public void longValues(int size, int[] docs, long[] values, long defaultValue)
-              throws IOException {
+          public void prefetchLongValues(int size, int[] docs) throws IOException {
             if (PrefetchConfig.isEnabled() && size > 0 && entry.bitsPerValue > 0) {
               prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
             }
-            super.longValues(size, docs, values, defaultValue);
           }
             };
           } else {
@@ -618,12 +612,10 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               }
 
           @Override
-          public void longValues(int size, int[] docs, long[] values, long defaultValue)
-              throws IOException {
+          public void prefetchLongValues(int size, int[] docs) throws IOException {
             if (PrefetchConfig.isEnabled() && size > 0 && entry.bitsPerValue > 0) {
               prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
             }
-            super.longValues(size, docs, values, defaultValue);
           }
             };
           }
@@ -647,12 +639,10 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           }
 
           @Override
-          public void longValues(int size, int[] docs, long[] values, long defaultValue)
-              throws IOException {
+          public void prefetchLongValues(int size, int[] docs) throws IOException {
             if (PrefetchConfig.isEnabled() && size > 0) {
               prefetchDISI(disi, size, docs);
             }
-            super.longValues(size, docs, values, defaultValue);
           }
         };
       } else {
@@ -675,28 +665,12 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             }
 
             @Override
-            public void longValues(int size, int[] docs, long[] vals, long defaultValue)
-                throws IOException {
-              if (!PrefetchConfig.isEnabled() || size == 0) { super.longValues(size, docs, vals, defaultValue); return; }
-              prefetchDISI(disi, size, docs);
-              // Two-pass: traverse DISI, prefetch rankSlice at DISI indices, then read
-              int[] indices = new int[size];
-              boolean[] exists = new boolean[size];
-              for (int i = 0; i < size; i++) {
-                exists[i] = disi.advanceExact(docs[i]);
-                if (exists[i]) indices[i] = disi.index();
-              }
-              // Prefetch varying BPV rankSlice using DISI indices as positions
-              int existCount = 0;
-              for (int i = 0; i < size; i++) if (exists[i]) existCount++;
-              if (existCount > 0) {
-                int[] compact = new int[existCount];
-                int idx = 0;
-                for (int i = 0; i < size; i++) if (exists[i]) compact[idx++] = indices[i];
-                prefetchVaryingBPV(vBPVReader, existCount, compact);
-              }
-              for (int i = 0; i < size; i++) {
-                vals[i] = exists[i] ? vBPVReader.getLongValue(indices[i]) : defaultValue;
+            public void prefetchLongValues(int size, int[] docs) throws IOException {
+              if (PrefetchConfig.isEnabled() && size > 0) {
+                prefetchDISI(disi, size, docs);
+                if (entry.bitsPerValue > 0) {
+                  prefetchVaryingBPV(vBPVReader, size, docs);
+                }
               }
             }
           };
@@ -712,25 +686,12 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               }
 
               @Override
-              public void longValues(int size, int[] docs, long[] vals, long defaultValue)
-                  throws IOException {
-                if (!PrefetchConfig.isEnabled() || size == 0) { super.longValues(size, docs, vals, defaultValue); return; }
-                prefetchDISI(disi, size, docs);
-                // Two-pass: traverse DISI, prefetch value data, then read
-                int[] indices = new int[size];
-                boolean[] exists = new boolean[size];
-                for (int i = 0; i < size; i++) {
-                  exists[i] = disi.advanceExact(docs[i]);
-                  if (exists[i]) indices[i] = disi.index();
-                }
-                if (entry.bitsPerValue > 0) {
-                  int count = 0;
-                  int[] compact = new int[size];
-                  for (int i = 0; i < size; i++) if (exists[i]) compact[count++] = indices[i];
-                  if (count > 0) prefetchFixedBPV(count, compact, slice, entry.bitsPerValue);
-                }
-                for (int i = 0; i < size; i++) {
-                  vals[i] = exists[i] ? table[(int) values.get(indices[i])] : defaultValue;
+              public void prefetchLongValues(int size, int[] docs) throws IOException {
+                if (PrefetchConfig.isEnabled() && size > 0) {
+                  prefetchDISI(disi, size, docs);
+                  if (entry.bitsPerValue > 0) {
+                    prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
+                  }
                 }
               }
             };
@@ -742,24 +703,12 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               }
 
               @Override
-              public void longValues(int size, int[] docs, long[] vals, long defaultValue)
-                  throws IOException {
-                if (!PrefetchConfig.isEnabled() || size == 0) { super.longValues(size, docs, vals, defaultValue); return; }
-                prefetchDISI(disi, size, docs);
-                int[] indices = new int[size];
-                boolean[] exists = new boolean[size];
-                for (int i = 0; i < size; i++) {
-                  exists[i] = disi.advanceExact(docs[i]);
-                  if (exists[i]) indices[i] = disi.index();
-                }
-                if (entry.bitsPerValue > 0) {
-                  int count = 0;
-                  int[] compact = new int[size];
-                  for (int i = 0; i < size; i++) if (exists[i]) compact[count++] = indices[i];
-                  if (count > 0) prefetchFixedBPV(count, compact, slice, entry.bitsPerValue);
-                }
-                for (int i = 0; i < size; i++) {
-                  vals[i] = exists[i] ? values.get(indices[i]) : defaultValue;
+              public void prefetchLongValues(int size, int[] docs) throws IOException {
+                if (PrefetchConfig.isEnabled() && size > 0) {
+                  prefetchDISI(disi, size, docs);
+                  if (entry.bitsPerValue > 0) {
+                    prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
+                  }
                 }
               }
             };
@@ -773,24 +722,12 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               }
 
               @Override
-              public void longValues(int size, int[] docs, long[] vals, long defaultValue)
-                  throws IOException {
-                if (!PrefetchConfig.isEnabled() || size == 0) { super.longValues(size, docs, vals, defaultValue); return; }
-                prefetchDISI(disi, size, docs);
-                int[] indices = new int[size];
-                boolean[] exists = new boolean[size];
-                for (int i = 0; i < size; i++) {
-                  exists[i] = disi.advanceExact(docs[i]);
-                  if (exists[i]) indices[i] = disi.index();
-                }
-                if (entry.bitsPerValue > 0) {
-                  int count = 0;
-                  int[] compact = new int[size];
-                  for (int i = 0; i < size; i++) if (exists[i]) compact[count++] = indices[i];
-                  if (count > 0) prefetchFixedBPV(count, compact, slice, entry.bitsPerValue);
-                }
-                for (int i = 0; i < size; i++) {
-                  vals[i] = exists[i] ? mul * values.get(indices[i]) + delta : defaultValue;
+              public void prefetchLongValues(int size, int[] docs) throws IOException {
+                if (PrefetchConfig.isEnabled() && size > 0) {
+                  prefetchDISI(disi, size, docs);
+                  if (entry.bitsPerValue > 0) {
+                    prefetchFixedBPV(size, docs, slice, entry.bitsPerValue);
+                  }
                 }
               }
             };
@@ -980,6 +917,15 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             bytesSlice.readBytes((long) doc * length, bytes.bytes, 0, length);
             return bytes;
           }
+
+          @Override
+          public void prefetchBinaryValues(int[] docs, int size) throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0 && length > 0) {
+              long firstByte = (long) docs[0] * length;
+              long lastByte = (long) docs[size - 1] * length + length;
+              bytesSlice.prefetch(firstByte, lastByte - firstByte);
+            }
+          }
         };
       } else {
         // variable length
@@ -1001,6 +947,19 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             bytes.length = (int) (addresses.get(doc + 1L) - startOffset);
             bytesSlice.readBytes(startOffset, bytes.bytes, 0, bytes.length);
             return bytes;
+          }
+
+          @Override
+          public void prefetchBinaryValues(int[] docs, int size) throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0) {
+              // Prefetch address index entries for first and last doc
+              // (DirectMonotonicReader will read blocks containing these)
+              long firstAddr = addresses.get(docs[0]);
+              long lastAddr = addresses.get(docs[size - 1] + 1L);
+              if (lastAddr > firstAddr) {
+                bytesSlice.prefetch(firstAddr, lastAddr - firstAddr);
+              }
+            }
           }
         };
       }
@@ -1025,6 +984,17 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             bytesSlice.readBytes((long) disi.index() * length, bytes.bytes, 0, length);
             return bytes;
           }
+
+          @Override
+          public void prefetchBinaryValues(int[] docs, int size) throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0 && length > 0) {
+              prefetchDISI(disi, size, docs);
+              // Conservative: prefetch the full range of possible positions
+              long firstByte = (long) docs[0] * length;
+              long lastByte = (long) docs[size - 1] * length + length;
+              bytesSlice.prefetch(firstByte, lastByte - firstByte);
+            }
+          }
         };
       } else {
         // variable length
@@ -1047,6 +1017,13 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             bytes.length = (int) (addresses.get(index + 1L) - startOffset);
             bytesSlice.readBytes(startOffset, bytes.bytes, 0, bytes.length);
             return bytes;
+          }
+
+          @Override
+          public void prefetchBinaryValues(int[] docs, int size) throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0) {
+              prefetchDISI(disi, size, docs);
+            }
           }
         };
       }
@@ -1127,10 +1104,14 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           @Override
           public void ordValues(int size, int[] docs, int[] ords, int defaultOrd)
               throws IOException {
+            super.ordValues(size, docs, ords, defaultOrd);
+          }
+
+          @Override
+          public void prefetchOrdValues(int size, int[] docs) throws IOException {
             if (PrefetchConfig.isEnabled() && size > 0 && ordsEntry.bitsPerValue > 0) {
               prefetchFixedBPV(size, docs, slice, ordsEntry.bitsPerValue);
             }
-            super.ordValues(size, docs, ords, defaultOrd);
           }
         };
       } else if (ordsEntry.docsWithFieldOffset >= 0) { // sparse but non-empty
@@ -1186,29 +1167,13 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           }
 
           @Override
-          public void ordValues(int size, int[] docs, int[] ords, int defaultOrd)
-              throws IOException {
+          public void prefetchOrdValues(int size, int[] docs) throws IOException {
             if (PrefetchConfig.isEnabled() && size > 0) {
               prefetchDISI(disi, size, docs);
               if (ordsEntry.bitsPerValue > 0) {
-                // Two-pass: traverse DISI to find indices, prefetch value data, then read
-                int[] indices = new int[size];
-                boolean[] exists = new boolean[size];
-                for (int i = 0; i < size; i++) {
-                  exists[i] = disi.advanceExact(docs[i]);
-                  if (exists[i]) indices[i] = disi.index();
-                }
-                int count = 0;
-                int[] compact = new int[size];
-                for (int i = 0; i < size; i++) if (exists[i]) compact[count++] = indices[i];
-                if (count > 0) prefetchFixedBPV(count, compact, slice, ordsEntry.bitsPerValue);
-                for (int i = 0; i < size; i++) {
-                  ords[i] = exists[i] ? (int) values.get(indices[i]) : defaultOrd;
-                }
-                return;
+                prefetchFixedBPV(size, docs, slice, ordsEntry.bitsPerValue);
               }
             }
-            super.ordValues(size, docs, ords, defaultOrd);
           }
         };
       }
@@ -1956,6 +1921,22 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           public int docIDRunEnd() throws IOException {
             return maxDoc;
           }
+
+          @Override
+          public void prefetchOrds(int[] docs, int size) throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0) {
+              // Prefetch address index range
+              long firstAddr = addresses.get(docs[0]);
+              long lastAddr = addresses.get(docs[size - 1] + 1L);
+              // Prefetch ordinal data range
+              if (lastAddr > firstAddr && ordsEntry.bitsPerValue > 0) {
+                int readSize = ordsEntry.bitsPerValue <= 8 ? 1 : ordsEntry.bitsPerValue <= 16 ? 2 : ordsEntry.bitsPerValue <= 32 ? 4 : 8;
+                long firstByte = (firstAddr * ordsEntry.bitsPerValue) / 8;
+                long lastByte = ((lastAddr - 1) * ordsEntry.bitsPerValue) / 8 + readSize;
+                slice.prefetch(firstByte, lastByte - firstByte);
+              }
+            }
+          }
         };
       } else if (ordsEntry.docsWithFieldOffset >= 0) { // sparse but non-empty
         final IndexedDISI disi =
@@ -2032,6 +2013,16 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           @Override
           public int docIDRunEnd() throws IOException {
             return disi.docIDRunEnd();
+          }
+
+          @Override
+          public void prefetchOrds(int[] docs, int size) throws IOException {
+            if (PrefetchConfig.isEnabled() && size > 0) {
+              prefetchDISI(disi, size, docs);
+              if (ordsEntry.bitsPerValue > 0) {
+                prefetchFixedBPV(size, docs, slice, ordsEntry.bitsPerValue);
+              }
+            }
           }
         };
       }

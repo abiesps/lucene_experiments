@@ -115,4 +115,16 @@ public abstract class NumericDocValues extends DocValuesIterator {
       values[i] = value;
     }
   }
+
+  /**
+   * Async prefetch hint for a batch of doc IDs. Issues {@code RandomAccessInput.prefetch()}
+   * calls for the byte ranges that a subsequent {@code longValues()} call on the same docs
+   * would read. This is a hint — it warms cache but does not affect correctness.
+   *
+   * @param size the number of doc IDs to prefetch
+   * @param docs sorted ascending array of doc IDs (no duplicates)
+   */
+  public void prefetchLongValues(int size, int[] docs) throws IOException {
+    // default no-op — codec implementations override with async prefetch
+  }
 }
