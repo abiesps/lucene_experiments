@@ -230,6 +230,7 @@ public abstract class VectorizationProvider {
           "org.apache.lucene.codecs.hnsw.FlatVectorScorerUtil",
           "org.apache.lucene.util.VectorUtil",
           "org.apache.lucene.codecs.lucene104.Lucene104PostingsReader",
+          "org.apache.lucene.codecs.lucene104.Lucene104NavPostingsReader",
           "org.apache.lucene.codecs.lucene104.PostingIndexInput",
           "org.apache.lucene.codecs.lucene90.Lucene90DocValuesProducer",
           "org.apache.lucene.tests.util.TestSysoutsLimits");
