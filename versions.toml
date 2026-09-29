@@ -3,6 +3,7 @@
 antlr = "4.13.2"
 asm = "9.6"
 assertj = "3.21.0"
+caffeine = "3.0.5"
 commons-codec = "1.17.2"
 commons-compress = "1.19"
 ecj = "3.36.0"
@@ -41,6 +42,7 @@ antlr-runtime = { module = "org.antlr:antlr4-runtime", version.ref = "antlr" }
 asm-commons = { module = "org.ow2.asm:asm-commons", version.ref = "asm" }
 asm-core = { module = "org.ow2.asm:asm", version.ref = "asm" }
 assertj = { module = "org.assertj:assertj-core", version.ref = "assertj" }
+caffeine = { module = "com.github.ben-manes.caffeine:caffeine", version.ref = "caffeine" }
 commons-codec = { module = "commons-codec:commons-codec", version.ref = "commons-codec" }
 commons-compress = { module = "org.apache.commons:commons-compress", version.ref = "commons-compress" }
 ecj = { module = "org.eclipse.jdt:ecj", version.ref = "ecj" }

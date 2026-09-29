@@ -124,3 +124,13 @@ grant codeBase "file:${junit.jar}" {
 grant codeBase "file:${lucene.test.framework}${/}-" {
   permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
 };
+
+// lucene/bufferpool: Caffeine uses MethodHandles.privateLookupIn in static initializers, and the
+// module builds its cache inside doPrivileged. Both properties are only set for that module's tests;
+// elsewhere they are undefined and these entries are ignored.
+grant codeBase "file:${caffeine.jar}" {
+  permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
+};
+grant codeBase "file:${lucene.bufferpool}${/}-" {
+  permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
+};
