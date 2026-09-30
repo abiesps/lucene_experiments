@@ -309,6 +309,15 @@ public class TestLucene104DualNavPrefetch extends LuceneTestCase {
     int callAgain = pe.prefetchAhead(0, bytesAhead);
     for (int doc = pe.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = pe.nextDoc()) {
       actual.add(doc);
+      // Callers may ask again before the call-again doc (OpenSearch scores in doc-ID chunks and
+      // BooleanScorer asks every clause at the start of each chunk): that must not plan further.
+      if (callAgain != DocIdSetIterator.NO_MORE_DOCS
+          && doc + 1 < callAgain
+          && random().nextInt(3) == 0) {
+        final int before = recorder.prefetches(docFile).size();
+        assertEquals(msg + " early call moved", callAgain, pe.prefetchAhead(doc + 1, bytesAhead));
+        assertEquals(msg + " early call prefetched", before, recorder.prefetches(docFile).size());
+      }
       // the next nextDoc() may start reading the block of doc + 1
       while (callAgain != DocIdSetIterator.NO_MORE_DOCS && doc + 1 >= callAgain) {
         final int next = pe.prefetchAhead(doc + 1, bytesAhead);

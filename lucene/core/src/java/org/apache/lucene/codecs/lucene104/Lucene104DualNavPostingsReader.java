@@ -1638,9 +1638,25 @@ public final class Lucene104DualNavPostingsReader extends PostingsReaderBase {
         planRequestedFP = termStart;
         planDone = false;
         alHasBlock = false;
+        alCallAgain = -1;
         planNodeBytes = nodeBytes;
         planInitialized = true;
       }
+      if (fromDoc < alCallAgain) {
+        // The consumer has not reached the next node yet. The cursor is already past its position
+        // (on the block that reaches into the next node), so planning now would run one node
+        // further ahead on every early call, e.g. when a bulk scorer is called in doc-ID chunks.
+        return alCallAgain;
+      }
+      alCallAgain = alignedPlan(fromDoc, nodesAhead, nodeBytes);
+      return alCallAgain;
+    }
+
+    private int alCallAgain; // the doc returned by the last aligned call; earlier calls are no-ops
+
+    private int alignedPlan(int fromDoc, long nodesAhead, long nodeBytes) throws IOException {
+      final long termStart = planTermDocStartFP;
+      final long termEnd = termStart + planTermDocLength;
       // move the cursor to the postings block that holds fromDoc
       while (alHasBlock == false || planLastDoc < fromDoc) {
         if (alignedStep(fromDoc, Long.MIN_VALUE) == false) {
