@@ -61,4 +61,9 @@ public abstract class FilterNumericDocValues extends NumericDocValues {
   public long longValue() throws IOException {
     return in.longValue();
   }
+
+  @Override
+  public boolean prefetchNodes(int fromDoc, int toDoc, long nodeBytes) throws IOException {
+    return in.prefetchNodes(fromDoc, toDoc, nodeBytes);
+  }
 }

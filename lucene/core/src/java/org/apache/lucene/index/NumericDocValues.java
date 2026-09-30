@@ -85,6 +85,19 @@ public abstract class NumericDocValues extends DocValuesIterator {
   }
 
   /**
+   * Experimental prefetch hint: requests, in whole nodes of {@code nodeBytes} bytes of the
+   * underlying file (for example storage or cache blocks), the stored values of docs in {@code
+   * [fromDoc, toDoc)}. Implementations never request the same node twice and never move the
+   * iterator. The default does nothing.
+   *
+   * @return true if this instance supports the hint
+   * @lucene.experimental
+   */
+  public boolean prefetchNodes(int fromDoc, int toDoc, long nodeBytes) throws IOException {
+    return false;
+  }
+
+  /**
    * Offset-aware variant of {@link #longValues(int, int[], long[], long)}. Reads {@code size} doc
    * IDs starting at {@code docs[docsOffset]} and writes the corresponding values starting at {@code
    * values[valuesOffset]}. This follows the same convention as {@link System#arraycopy}.

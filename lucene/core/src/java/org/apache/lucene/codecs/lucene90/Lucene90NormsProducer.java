@@ -139,10 +139,60 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
     long normsOffset;
   }
 
+  /**
+   * Requests the stored norms of a doc range in whole nodes of the .nvd file. Node boundaries are
+   * file offsets (the slice starts at {@code normsOffset} of the .nvd file), clipped to this
+   * field's values. Requests only move forward, so no node is requested twice.
+   */
+  static final class NodePrefetcher {
+    private final RandomAccessInput slice;
+    private final long base; // file offset of the slice
+    private final int shift; // log2(bytes per norm)
+    private final long length;
+    private long requestedEnd; // slice-relative end of the requested nodes
+
+    NodePrefetcher(RandomAccessInput slice, long base, int bytesPerNorm) {
+      this.slice = slice;
+      this.base = base;
+      this.shift = Integer.numberOfTrailingZeros(bytesPerNorm);
+      this.length = slice.length();
+    }
+
+    void prefetch(int fromDoc, int toDoc, long nodeBytes) throws IOException {
+      if (toDoc <= fromDoc || nodeBytes <= 0) {
+        return;
+      }
+      long start = base + (((long) fromDoc) << shift);
+      long end = base + Math.min(length, ((long) toDoc) << shift);
+      start -= start % nodeBytes;
+      final long rem = end % nodeBytes;
+      if (rem != 0) {
+        end += nodeBytes - rem;
+      }
+      start = Math.max(Math.max(start - base, 0), requestedEnd);
+      end = Math.min(end - base, length);
+      if (end > start) {
+        slice.prefetch(start, end - start);
+        requestedEnd = end;
+      }
+    }
+  }
+
   abstract static class DenseNormsIterator extends NumericDocValues {
 
     final int maxDoc;
     int doc = -1;
+    // set for dense norms with stored values, see prefetchNodes
+    NodePrefetcher prefetcher;
+
+    @Override
+    public boolean prefetchNodes(int fromDoc, int toDoc, long nodeBytes) throws IOException {
+      if (prefetcher == null) {
+        return false;
+      }
+      prefetcher.prefetch(fromDoc, Math.min(toDoc, maxDoc), nodeBytes);
+      return true;
+    }
 
     DenseNormsIterator(int maxDoc) {
       this.maxDoc = maxDoc;
@@ -391,47 +441,9 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
         };
       }
       final RandomAccessInput slice = getDataInput(field, entry);
-      switch (entry.bytesPerNorm) {
-        case 1:
-          return new DenseNormsIterator(maxDoc) {
-            @Override
-            public long longValue() throws IOException {
-              return slice.readByte(doc);
-            }
-
-            @Override
-            public void longValues(int size, int[] docs, long[] values, long defaultValue)
-                throws IOException {
-              // Delegate to help performance: when the super call inlines, calls to
-              // #advanceExact/#longValue become monomorphic.
-              super.longValues(size, docs, values, defaultValue);
-            }
-          };
-        case 2:
-          return new DenseNormsIterator(maxDoc) {
-            @Override
-            public long longValue() throws IOException {
-              return slice.readShort(((long) doc) << 1);
-            }
-          };
-        case 4:
-          return new DenseNormsIterator(maxDoc) {
-            @Override
-            public long longValue() throws IOException {
-              return slice.readInt(((long) doc) << 2);
-            }
-          };
-        case 8:
-          return new DenseNormsIterator(maxDoc) {
-            @Override
-            public long longValue() throws IOException {
-              return slice.readLong(((long) doc) << 3);
-            }
-          };
-        default:
-          // should not happen, we already validate bytesPerNorm in readFields
-          throw new AssertionError();
-      }
+      final DenseNormsIterator dense = denseNorms(entry, slice);
+      dense.prefetcher = new NodePrefetcher(slice, entry.normsOffset, entry.bytesPerNorm);
+      return dense;
     } else {
       // sparse
       final IndexInput disiInput = getDisiInput(field, entry);
@@ -494,6 +506,50 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
           // should not happen, we already validate bytesPerNorm in readFields
           throw new AssertionError();
       }
+    }
+  }
+
+  private DenseNormsIterator denseNorms(NormsEntry entry, RandomAccessInput slice) {
+    switch (entry.bytesPerNorm) {
+      case 1:
+        return new DenseNormsIterator(maxDoc) {
+          @Override
+          public long longValue() throws IOException {
+            return slice.readByte(doc);
+          }
+
+          @Override
+          public void longValues(int size, int[] docs, long[] values, long defaultValue)
+              throws IOException {
+            // Delegate to help performance: when the super call inlines, calls to
+            // #advanceExact/#longValue become monomorphic.
+            super.longValues(size, docs, values, defaultValue);
+          }
+        };
+      case 2:
+        return new DenseNormsIterator(maxDoc) {
+          @Override
+          public long longValue() throws IOException {
+            return slice.readShort(((long) doc) << 1);
+          }
+        };
+      case 4:
+        return new DenseNormsIterator(maxDoc) {
+          @Override
+          public long longValue() throws IOException {
+            return slice.readInt(((long) doc) << 2);
+          }
+        };
+      case 8:
+        return new DenseNormsIterator(maxDoc) {
+          @Override
+          public long longValue() throws IOException {
+            return slice.readLong(((long) doc) << 3);
+          }
+        };
+      default:
+        // should not happen, we already validate bytesPerNorm in readFields
+        throw new AssertionError();
     }
   }
 
