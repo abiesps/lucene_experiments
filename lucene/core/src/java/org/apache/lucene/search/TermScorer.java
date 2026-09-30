@@ -111,6 +111,11 @@ public final class TermScorer extends Scorer {
     return planCache.getMaxScore(upTo);
   }
 
+  /** Prefetch hint on this scorer's postings, see {@link DocIdSetIterator#prefetchAhead}. */
+  int prefetchPostingsAhead(int fromDoc, long bytesAhead) throws IOException {
+    return postingsEnum.prefetchAhead(fromDoc, bytesAhead);
+  }
+
   /** Requests the norms of docs in {@code [from, to)} in whole nodes; false if not supported. */
   boolean prefetchNorms(int from, int to, long nodeBytes) throws IOException {
     return norms != null && norms.prefetchNodes(from, to, nodeBytes);

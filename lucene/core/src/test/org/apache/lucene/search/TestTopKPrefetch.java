@@ -48,6 +48,8 @@ public class TestTopKPrefetch extends LuceneTestCase {
   @Override
   public void tearDown() throws Exception {
     TopKPrefetch.setNormsDocsAhead(0);
+    TopKPrefetch.setDocNodesAhead(0);
+    DisjunctionPrefetch.setNodeBytes(0);
     TopKPrefetch.setFilter(true);
     TopKPrefetch.setNodeBytes(128 * 1024);
     Lucene104DualNavPostingsFormat.setReadMode(ReadMode.DOC);
@@ -109,6 +111,40 @@ public class TestTopKPrefetch extends LuceneTestCase {
           }
         }
         assertTrue("the filter never rejected a window", filteredSomething);
+      }
+    }
+  }
+
+  public void testPostingsPrefetchSameTopK() throws IOException {
+    final Recorder recorder = new Recorder();
+    try (Directory dir = new RecordingDirectory(newFSDirectory(createTempDir()), recorder)) {
+      index(dir, atLeast(300_000));
+      Lucene104DualNavPostingsFormat.setReadMode(ReadMode.NAV);
+      try (DirectoryReader r = DirectoryReader.open(dir)) {
+        final IndexSearcher searcher = new IndexSearcher(r);
+        searcher.setQueryCache(null);
+        long docPrefetches = 0;
+        for (int iter = 0; iter < 8; iter++) {
+          final Query q = randomQuery(random());
+          final int k = random().nextBoolean() ? 10 : 100;
+          TopKPrefetch.setNormsDocsAhead(0);
+          TopKPrefetch.setDocNodesAhead(0);
+          DisjunctionPrefetch.setNodeBytes(0);
+          final Run expected = run(searcher, q, k);
+
+          final long nodeBytes = 1L << (8 + random().nextInt(6));
+          TopKPrefetch.setNodeBytes(nodeBytes);
+          DisjunctionPrefetch.setNodeBytes(nodeBytes);
+          TopKPrefetch.setDocNodesAhead(1 + random().nextInt(2));
+          TopKPrefetch.setNormsDocsAhead(
+              random().nextBoolean() ? 0 : MaxScoreBulkScorer.INNER_WINDOW_SIZE * 4);
+          TopKPrefetch.setFilter(false);
+          recorder.reset();
+          final Run withPostings = run(searcher, q, k);
+          assertSameTopK(q + " postings prefetch", expected, withPostings);
+          docPrefetches += recorder.prefetchCount(".doc");
+        }
+        assertTrue("no .doc prefetch was issued", docPrefetches > 0);
       }
     }
   }
@@ -239,6 +275,16 @@ public class TestTopKPrefetch extends LuceneTestCase {
       return sb.toString();
     }
 
+    synchronized long prefetchCount(String ext) {
+      long n = 0;
+      for (Object[] e : events) {
+        if (e[0].equals(ext) && (boolean) e[4]) {
+          n++;
+        }
+      }
+      return n;
+    }
+
     synchronized List<long[]> reads(String ext) {
       List<long[]> out = new ArrayList<>();
       for (Object[] e : events) {
@@ -281,7 +327,9 @@ public class TestTopKPrefetch extends LuceneTestCase {
     @Override
     public IndexInput openInput(String name, IOContext context) throws IOException {
       final IndexInput input = in.openInput(name, context);
-      return name.endsWith(".nvd") ? new RecordingInput(input, name, 0, recorder) : input;
+      return name.endsWith(".nvd") || name.endsWith(".doc")
+          ? new RecordingInput(input, name, 0, recorder)
+          : input;
     }
   }
 

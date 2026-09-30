@@ -77,8 +77,28 @@ public final class TopKPrefetch {
     return filter;
   }
 
-  /** True if the planner is on (a planning impacts enum is created per top-k term clause). */
+  private static volatile int docNodesAhead;
+
+  /**
+   * Sets how many nodes of each clause's postings to keep requested ahead of the node being read
+   * (see {@link DocIdSetIterator#prefetchAhead}); 0 disables it. Postings that plan in whole nodes
+   * (Lucene104DualNav in nav mode) do so only when {@link DisjunctionPrefetch#setNodeBytes} is set,
+   * normally to the same node size.
+   */
+  public static void setDocNodesAhead(int nodes) {
+    if (nodes < 0) {
+      throw new IllegalArgumentException("nodes must be >= 0, got " + nodes);
+    }
+    docNodesAhead = nodes;
+  }
+
+  /** Returns how many postings nodes are kept requested ahead per clause, 0 when disabled. */
+  public static int getDocNodesAhead() {
+    return docNodesAhead;
+  }
+
+  /** True if the planner is on (norms or postings prefetch). */
   public static boolean isEnabled() {
-    return normsDocsAhead > 0;
+    return normsDocsAhead > 0 || docNodesAhead > 0;
   }
 }

@@ -93,7 +93,11 @@ final class MaxScoreBulkScorer extends BulkScorer {
 
   // ---- experimental top-k prefetch, see TopKPrefetch ----
 
-  private int prefetchDocsAhead; // 0 = off
+  private boolean prefetchOn;
+  private int prefetchDocsAhead; // norms look-ahead in doc IDs, 0 = no norms prefetch
+  private long postingsBytesAhead; // postings look-ahead per clause, 0 = no postings prefetch
+  private TermScorer[] postingsScorers = new TermScorer[0];
+  private int[] postingsCallAgain = new int[0];
   private long prefetchNodeBytes;
   private boolean prefetchFilter;
   // one scorer per field whose norms are requested (clauses on the same field share norms)
@@ -108,10 +112,26 @@ final class MaxScoreBulkScorer extends BulkScorer {
 
   private void setUpPrefetch(List<Scorer> scorers) {
     prefetchDocsAhead = TopKPrefetch.getNormsDocsAhead();
+    prefetchNodeBytes = TopKPrefetch.getNodeBytes();
+    postingsBytesAhead = (long) TopKPrefetch.getDocNodesAhead() * prefetchNodeBytes;
+    if (prefetchDocsAhead <= 0 && postingsBytesAhead <= 0) {
+      return;
+    }
+    final List<TermScorer> postings = new ArrayList<>();
+    for (Scorer scorer : scorers) {
+      if (scorer instanceof TermScorer ts && ts.planField() != null) {
+        postings.add(ts);
+      }
+    }
+    if (postingsBytesAhead > 0) {
+      postingsScorers = postings.toArray(new TermScorer[0]);
+      postingsCallAgain = new int[postingsScorers.length];
+      Arrays.fill(postingsCallAgain, -1);
+    }
+    prefetchOn = true;
     if (prefetchDocsAhead <= 0) {
       return;
     }
-    prefetchNodeBytes = TopKPrefetch.getNodeBytes();
     final List<TermScorer> norms = new ArrayList<>();
     final List<TermScorer> plan = new ArrayList<>();
     final List<String> fields = new ArrayList<>();
@@ -149,6 +169,35 @@ final class MaxScoreBulkScorer extends BulkScorer {
    * #INNER_WINDOW_SIZE} docs and all are eligible.
    */
   private void planPrefetch(int cur) throws IOException {
+    if (postingsBytesAhead > 0) {
+      planPostings(cur);
+    }
+    if (prefetchDocsAhead > 0) {
+      planNorms(cur);
+    }
+  }
+
+  /**
+   * Keeps each clause's postings requested ahead in whole nodes. A clause's call-again doc is where
+   * it starts reading its next node; it is asked again as soon as that doc is inside the window
+   * about to be scored, as in BooleanScorer's aligned mode.
+   */
+  private void planPostings(int cur) throws IOException {
+    final int windowEnd = (int) Math.min((long) cur + INNER_WINDOW_SIZE, Integer.MAX_VALUE);
+    for (int i = 0; i < postingsScorers.length; i++) {
+      while (postingsCallAgain[i] < windowEnd) {
+        final int from = Math.max(cur, postingsCallAgain[i]);
+        final int next = postingsScorers[i].prefetchPostingsAhead(from, postingsBytesAhead);
+        if (next <= from) {
+          postingsCallAgain[i] = DocIdSetIterator.NO_MORE_DOCS; // no progress: stop asking
+          break;
+        }
+        postingsCallAgain[i] = next;
+      }
+    }
+  }
+
+  private void planNorms(int cur) throws IOException {
     final int limit = (int) Math.min((long) cur + prefetchDocsAhead, maxDoc);
     if (planDoc < cur) {
       planDoc = cur; // docs behind the scorer are done
@@ -210,7 +259,7 @@ final class MaxScoreBulkScorer extends BulkScorer {
     int outerWindowMin = min;
     outer:
     while (outerWindowMin < max) {
-      if (prefetchDocsAhead > 0) {
+      if (prefetchOn) {
         planPrefetch(outerWindowMin);
       }
       int outerWindowMax = computeOuterWindowMax(outerWindowMin);
@@ -255,7 +304,7 @@ final class MaxScoreBulkScorer extends BulkScorer {
       }
 
       while (top.doc < outerWindowMax) {
-        if (prefetchDocsAhead > 0) {
+        if (prefetchOn) {
           planPrefetch(top.doc);
         }
         scoreInnerWindow(collector, acceptDocs, outerWindowMax, filter);
