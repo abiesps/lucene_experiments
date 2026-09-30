@@ -26,11 +26,14 @@ import org.apache.lucene.document.Field;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.document.TextField;
 import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.FilterDirectoryReader;
+import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.PostingsEnum;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
@@ -105,6 +108,102 @@ public class TestLucene104DualNavPrefetch extends LuceneTestCase {
           }
         }
       }
+    }
+  }
+
+  /**
+   * The hint must survive reader wrappers that filter postings, as OpenSearch does for query
+   * cancellation (FilterPostingsEnum around every PostingsEnum).
+   */
+  public void testPrefetchThroughFilterPostingsEnum() throws IOException {
+    final Recorder recorder = new Recorder();
+    try (Directory dir = new RecordingDirectory(newFSDirectory(createTempDir()), recorder)) {
+      IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
+      iwc.setCodec(TestUtil.alwaysPostingsFormat(new Lucene104DualNavPostingsFormat()));
+      iwc.setUseCompoundFile(false);
+      final int numDocs = atLeast(80_000);
+      try (IndexWriter w = new IndexWriter(dir, iwc)) {
+        for (int i = 0; i < numDocs; i++) {
+          Document doc = new Document();
+          if (i % 2 == 0) doc.add(new StringField("kw", "half", Field.Store.NO));
+          if (i % 7 == 1) doc.add(new StringField("kw", "seventh", Field.Store.NO));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      Lucene104DualNavPostingsFormat.setReadMode(ReadMode.NAV);
+      try (DirectoryReader r = new PostingsWrappingDirectoryReader(DirectoryReader.open(dir))) {
+        final IndexSearcher searcher = new IndexSearcher(r);
+        searcher.setQueryCache(null);
+        BooleanQuery.Builder b = new BooleanQuery.Builder();
+        b.add(new TermQuery(new Term("kw", "half")), BooleanClause.Occur.SHOULD);
+        b.add(new TermQuery(new Term("kw", "seventh")), BooleanClause.Occur.SHOULD);
+        final BooleanQuery q = b.build();
+        DisjunctionPrefetch.setBytesAhead(0);
+        final int expected = searcher.count(q);
+        recorder.reset();
+        final int withoutPrefetch = recorder.prefetches(docFile(dir)).size();
+        DisjunctionPrefetch.setBytesAhead(1L << 12);
+        recorder.reset();
+        assertEquals(expected, searcher.count(q));
+        assertTrue(
+            "prefetchAhead did not pass through FilterPostingsEnum",
+            recorder.prefetches(docFile(dir)).size() > withoutPrefetch + 2);
+      }
+    }
+  }
+
+  /** Wraps every PostingsEnum in a FilterPostingsEnum that overrides nothing. */
+  private static final class PostingsWrappingDirectoryReader extends FilterDirectoryReader {
+    PostingsWrappingDirectoryReader(DirectoryReader in) throws IOException {
+      super(
+          in,
+          new SubReaderWrapper() {
+            @Override
+            public LeafReader wrap(LeafReader reader) {
+              return new FilterLeafReader(reader) {
+                @Override
+                public Terms terms(String field) throws IOException {
+                  final Terms terms = super.terms(field);
+                  if (terms == null) {
+                    return null;
+                  }
+                  return new FilterTerms(terms) {
+                    @Override
+                    public TermsEnum iterator() throws IOException {
+                      return new FilterTermsEnum(in.iterator()) {
+                        @Override
+                        public PostingsEnum postings(PostingsEnum reuse, int flags)
+                            throws IOException {
+                          return new FilterPostingsEnum(in.postings(null, flags)) {};
+                        }
+                      };
+                    }
+                  };
+                }
+
+                @Override
+                public CacheHelper getCoreCacheHelper() {
+                  return null;
+                }
+
+                @Override
+                public CacheHelper getReaderCacheHelper() {
+                  return null;
+                }
+              };
+            }
+          });
+    }
+
+    @Override
+    protected DirectoryReader doWrapDirectoryReader(DirectoryReader in) throws IOException {
+      return new PostingsWrappingDirectoryReader(in);
+    }
+
+    @Override
+    public CacheHelper getReaderCacheHelper() {
+      return null;
     }
   }
 

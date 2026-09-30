@@ -314,6 +314,11 @@ public abstract class FilterLeafReader extends LeafReader {
     }
 
     @Override
+    public int prefetchAhead(int fromDoc, long bytesAhead) throws IOException {
+      return in.prefetchAhead(fromDoc, bytesAhead);
+    }
+
+    @Override
     public PostingsEnum unwrap() {
       return in;
     }
