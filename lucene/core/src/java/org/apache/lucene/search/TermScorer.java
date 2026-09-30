@@ -99,12 +99,16 @@ public final class TermScorer extends Scorer {
   }
 
   /**
-   * Upper bound of the score of any doc in {@code [from, to)}, from impacts read ahead by the
-   * planning enum. Calls must have non-decreasing {@code from}.
+   * Moves the planning enum's impacts to {@code target} and returns the last doc ID of its level-0
+   * block (inclusive). Calls must have non-decreasing targets.
    */
-  float planMaxScore(int from, int to) throws IOException {
-    planCache.advanceShallow(from);
-    return planCache.getMaxScore(to - 1);
+  int planAdvanceShallow(int target) throws IOException {
+    return planCache.advanceShallow(target);
+  }
+
+  /** Upper bound of the score of any doc up to {@code upTo}, from the planning enum's impacts. */
+  float planMaxScore(int upTo) throws IOException {
+    return planCache.getMaxScore(upTo);
   }
 
   /** Requests the norms of docs in {@code [from, to)} in whole nodes; false if not supported. */

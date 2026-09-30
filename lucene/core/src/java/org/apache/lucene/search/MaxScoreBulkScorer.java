@@ -141,37 +141,49 @@ final class MaxScoreBulkScorer extends BulkScorer {
   }
 
   /**
-   * Requests the norms of every eligible window in {@code [cur, cur + docsAhead)} that is not
-   * planned yet. Windows are aligned to {@link #INNER_WINDOW_SIZE}; eligible means the sum of the
-   * clauses' max scores over the window can reach the current minimum competitive score.
+   * Requests the norms of every eligible doc range in {@code [cur, cur + docsAhead)} that is not
+   * planned yet. With the filter, a range ends where the first of the clauses' current level-0
+   * impact blocks ends (at most {@link #INNER_WINDOW_SIZE} docs), so its bound is as tight as the
+   * one this scorer prunes with; it is eligible if the sum of the clauses' max scores over it can
+   * reach the current minimum competitive score. Without the filter, ranges are windows of {@link
+   * #INNER_WINDOW_SIZE} docs and all are eligible.
    */
   private void planPrefetch(int cur) throws IOException {
     final int limit = (int) Math.min((long) cur + prefetchDocsAhead, maxDoc);
-    final int curWindow = cur & ~(INNER_WINDOW_SIZE - 1);
-    if (planDoc < curWindow) {
-      planDoc = curWindow; // windows behind the scorer are done
+    if (planDoc < cur) {
+      planDoc = cur; // docs behind the scorer are done
     }
     while (planDoc < limit) {
-      final int windowEnd = (int) Math.min((long) planDoc + INNER_WINDOW_SIZE, maxDoc);
+      int end = (int) Math.min((long) planDoc + INNER_WINDOW_SIZE, maxDoc);
+      boolean eligible = true;
+      if (prefetchFilter) {
+        for (TermScorer ts : planScorers) {
+          final int upTo = ts.planAdvanceShallow(planDoc);
+          if (upTo != DocIdSetIterator.NO_MORE_DOCS) {
+            end = Math.min(end, upTo + 1);
+          }
+        }
+        eligible = rangeCanCompete(end - 1);
+      }
       plannedWindows++;
-      if (prefetchFilter == false || windowCanCompete(planDoc, windowEnd)) {
+      if (eligible) {
         eligibleWindows++;
         for (TermScorer ts : normsScorers) {
-          ts.prefetchNorms(planDoc, windowEnd, prefetchNodeBytes);
+          ts.prefetchNorms(planDoc, end, prefetchNodeBytes);
         }
       }
-      planDoc = windowEnd;
+      planDoc = end;
     }
   }
 
-  private boolean windowCanCompete(int from, int to) throws IOException {
+  private boolean rangeCanCompete(int upTo) throws IOException {
     final float minCompetitiveScore = scorable.minCompetitiveScore;
     if (minCompetitiveScore <= 0) {
       return true;
     }
     double sum = 0;
     for (TermScorer ts : planScorers) {
-      sum += ts.planMaxScore(from, to);
+      sum += ts.planMaxScore(upTo);
     }
     return (float) MathUtil.sumUpperBound(sum, planScorers.length) >= minCompetitiveScore;
   }
