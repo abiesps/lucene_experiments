@@ -157,8 +157,16 @@ public class TermQuery extends Query {
           }
 
           if (scoreMode == ScoreMode.TOP_SCORES) {
-            return new TermScorer(
-                termsEnum.impacts(PostingsEnum.FREQS), simScorer, norms, topLevelScoringClause);
+            TermScorer termScorer =
+                new TermScorer(
+                    termsEnum.impacts(PostingsEnum.FREQS), simScorer, norms, topLevelScoringClause);
+            if (TopKPrefetch.isEnabled()) {
+              // a second enum on the same term, only for reading upcoming impacts
+              termScorer.setPlanning(
+                  term.field(),
+                  TopKPrefetch.isFilter() ? termsEnum.impacts(PostingsEnum.FREQS) : null);
+            }
+            return termScorer;
           } else {
             int flags = scoreMode.needsScores() ? PostingsEnum.FREQS : PostingsEnum.NONE;
             return new TermScorer(termsEnum.postings(null, flags), simScorer, norms);

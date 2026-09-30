@@ -43,6 +43,11 @@ public final class TermScorer extends Scorer {
   private final MaxScoreCache maxScoreCache;
   private long[] normValues = LongsRef.EMPTY_LONGS;
 
+  // Experimental top-k prefetch planning (see TopKPrefetch): a second impacts enum on the same
+  // term, used only to read upcoming max scores, and the field whose norms the scorer reads.
+  private MaxScoreCache planCache;
+  private String planField;
+
   /** Construct a {@link TermScorer} that will iterate all documents. */
   public TermScorer(PostingsEnum postingsEnum, SimScorer scorer, NumericDocValues norms) {
     iterator = this.postingsEnum = postingsEnum;
@@ -75,6 +80,36 @@ public final class TermScorer extends Scorer {
     this.scorer = scorer;
     this.norms = norms;
     this.bulkScorer = scorer.asBulkSimScorer();
+  }
+
+  /** Attaches a planning-only impacts enum (see {@link TopKPrefetch}); never moves the scorer. */
+  void setPlanning(String field, ImpactsEnum planningImpacts) {
+    this.planField = field;
+    this.planCache = planningImpacts == null ? null : new MaxScoreCache(planningImpacts, scorer);
+  }
+
+  /** The field of this term, if planning was set up, else null. */
+  String planField() {
+    return planField;
+  }
+
+  /** True if {@link #planMaxScore} can be used. */
+  boolean canPlanScores() {
+    return planCache != null;
+  }
+
+  /**
+   * Upper bound of the score of any doc in {@code [from, to)}, from impacts read ahead by the
+   * planning enum. Calls must have non-decreasing {@code from}.
+   */
+  float planMaxScore(int from, int to) throws IOException {
+    planCache.advanceShallow(from);
+    return planCache.getMaxScore(to - 1);
+  }
+
+  /** Requests the norms of docs in {@code [from, to)} in whole nodes; false if not supported. */
+  boolean prefetchNorms(int from, int to, long nodeBytes) throws IOException {
+    return norms != null && norms.prefetchNodes(from, to, nodeBytes);
   }
 
   @Override

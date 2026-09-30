@@ -17,6 +17,7 @@
 package org.apache.lucene.search;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import org.apache.lucene.util.Bits;
@@ -67,6 +68,7 @@ final class MaxScoreBulkScorer extends BulkScorer {
       allScorers[i++] = w;
     }
     this.cost = cost;
+    setUpPrefetch(scorers);
     essentialQueue = DisiPriorityQueue.ofMaxSize(allScorers.length);
     maxScoreSums = new double[allScorers.length];
     docAndScoreAccBuffer = new DocAndScoreAccBuffer();
@@ -87,6 +89,91 @@ final class MaxScoreBulkScorer extends BulkScorer {
         this.filterMatches = new FixedBitSet(INNER_WINDOW_SIZE);
       }
     }
+  }
+
+  // ---- experimental top-k prefetch, see TopKPrefetch ----
+
+  private int prefetchDocsAhead; // 0 = off
+  private long prefetchNodeBytes;
+  private boolean prefetchFilter;
+  // one scorer per field whose norms are requested (clauses on the same field share norms)
+  private TermScorer[] normsScorers = new TermScorer[0];
+  // scorers whose planning impacts bound their scores; if a clause cannot be bounded, the filter is
+  // off for this query
+  private TermScorer[] planScorers = new TermScorer[0];
+  private int planDoc; // start of the next window that is not planned yet
+  // counters, for tests and diagnostics
+  long plannedWindows;
+  long eligibleWindows;
+
+  private void setUpPrefetch(List<Scorer> scorers) {
+    prefetchDocsAhead = TopKPrefetch.getNormsDocsAhead();
+    if (prefetchDocsAhead <= 0) {
+      return;
+    }
+    prefetchNodeBytes = TopKPrefetch.getNodeBytes();
+    final List<TermScorer> norms = new ArrayList<>();
+    final List<TermScorer> plan = new ArrayList<>();
+    final List<String> fields = new ArrayList<>();
+    boolean canFilter = TopKPrefetch.isFilter();
+    for (Scorer scorer : scorers) {
+      if (scorer instanceof TermScorer ts && ts.planField() != null) {
+        if (fields.contains(ts.planField()) == false) {
+          fields.add(ts.planField());
+          norms.add(ts);
+        }
+        if (ts.canPlanScores()) {
+          plan.add(ts);
+        } else {
+          canFilter = false;
+        }
+      } else {
+        canFilter = false; // a clause whose scores cannot be bounded ahead
+      }
+    }
+    if (norms.isEmpty()) {
+      prefetchDocsAhead = 0;
+      return;
+    }
+    normsScorers = norms.toArray(new TermScorer[0]);
+    planScorers = plan.toArray(new TermScorer[0]);
+    prefetchFilter = canFilter;
+  }
+
+  /**
+   * Requests the norms of every eligible window in {@code [cur, cur + docsAhead)} that is not
+   * planned yet. Windows are aligned to {@link #INNER_WINDOW_SIZE}; eligible means the sum of the
+   * clauses' max scores over the window can reach the current minimum competitive score.
+   */
+  private void planPrefetch(int cur) throws IOException {
+    final int limit = (int) Math.min((long) cur + prefetchDocsAhead, maxDoc);
+    final int curWindow = cur & ~(INNER_WINDOW_SIZE - 1);
+    if (planDoc < curWindow) {
+      planDoc = curWindow; // windows behind the scorer are done
+    }
+    while (planDoc < limit) {
+      final int windowEnd = (int) Math.min((long) planDoc + INNER_WINDOW_SIZE, maxDoc);
+      plannedWindows++;
+      if (prefetchFilter == false || windowCanCompete(planDoc, windowEnd)) {
+        eligibleWindows++;
+        for (TermScorer ts : normsScorers) {
+          ts.prefetchNorms(planDoc, windowEnd, prefetchNodeBytes);
+        }
+      }
+      planDoc = windowEnd;
+    }
+  }
+
+  private boolean windowCanCompete(int from, int to) throws IOException {
+    final float minCompetitiveScore = scorable.minCompetitiveScore;
+    if (minCompetitiveScore <= 0) {
+      return true;
+    }
+    double sum = 0;
+    for (TermScorer ts : planScorers) {
+      sum += ts.planMaxScore(from, to);
+    }
+    return (float) MathUtil.sumUpperBound(sum, planScorers.length) >= minCompetitiveScore;
   }
 
   // Number of outer windows that have been evaluated
@@ -111,6 +198,9 @@ final class MaxScoreBulkScorer extends BulkScorer {
     int outerWindowMin = min;
     outer:
     while (outerWindowMin < max) {
+      if (prefetchDocsAhead > 0) {
+        planPrefetch(outerWindowMin);
+      }
       int outerWindowMax = computeOuterWindowMax(outerWindowMin);
       outerWindowMax = Math.min(outerWindowMax, max);
 
@@ -139,6 +229,13 @@ final class MaxScoreBulkScorer extends BulkScorer {
         outerWindowMax = newOuterWindowMax;
       }
 
+      if (prefetchDocsAhead > 0) {
+        // this outer window is scored now: its norms are read whatever the look-ahead decided
+        for (TermScorer ts : normsScorers) {
+          ts.prefetchNorms(outerWindowMin, outerWindowMax, prefetchNodeBytes);
+        }
+      }
+
       DisiWrapper top = essentialQueue.top();
       while (top.doc < outerWindowMin) {
         top.doc = top.iterator.advance(outerWindowMin);
@@ -146,6 +243,9 @@ final class MaxScoreBulkScorer extends BulkScorer {
       }
 
       while (top.doc < outerWindowMax) {
+        if (prefetchDocsAhead > 0) {
+          planPrefetch(top.doc);
+        }
         scoreInnerWindow(collector, acceptDocs, outerWindowMax, filter);
         top = essentialQueue.top();
         if (scorable.minCompetitiveScore >= nextMinCompetitiveScore) {

@@ -142,14 +142,16 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
   /**
    * Requests the stored norms of a doc range in whole nodes of the .nvd file. Node boundaries are
    * file offsets (the slice starts at {@code normsOffset} of the .nvd file), clipped to this
-   * field's values. Requests only move forward, so no node is requested twice.
+   * field's values. Each node is requested at most once; nodes skipped earlier can still be
+   * requested later.
    */
   static final class NodePrefetcher {
     private final RandomAccessInput slice;
     private final long base; // file offset of the slice
     private final int shift; // log2(bytes per norm)
     private final long length;
-    private long requestedEnd; // slice-relative end of the requested nodes
+    private long nodeBytes;
+    private final FixedBitSetHolder requested = new FixedBitSetHolder();
 
     NodePrefetcher(RandomAccessInput slice, long base, int bytesPerNorm) {
       this.slice = slice;
@@ -159,22 +161,52 @@ final class Lucene90NormsProducer extends NormsProducer implements Cloneable {
     }
 
     void prefetch(int fromDoc, int toDoc, long nodeBytes) throws IOException {
-      if (toDoc <= fromDoc || nodeBytes <= 0) {
+      if (toDoc <= fromDoc || nodeBytes <= 0 || length == 0) {
         return;
       }
-      long start = base + (((long) fromDoc) << shift);
-      long end = base + Math.min(length, ((long) toDoc) << shift);
-      start -= start % nodeBytes;
-      final long rem = end % nodeBytes;
-      if (rem != 0) {
-        end += nodeBytes - rem;
+      if (nodeBytes != this.nodeBytes) {
+        this.nodeBytes = nodeBytes;
+        requested.reset();
       }
-      start = Math.max(Math.max(start - base, 0), requestedEnd);
-      end = Math.min(end - base, length);
-      if (end > start) {
-        slice.prefetch(start, end - start);
-        requestedEnd = end;
+      final long first = base / nodeBytes; // node of the first stored norm
+      final long startByte = base + (((long) fromDoc) << shift);
+      final long endByte = base + Math.min(length, ((long) toDoc) << shift); // exclusive
+      final long n0 = startByte / nodeBytes;
+      final long n1 = (endByte - 1) / nodeBytes;
+      long runStart = -1;
+      for (long n = n0; n <= n1 + 1; n++) {
+        final boolean want = n <= n1 && requested.getAndSet(n - first) == false;
+        if (want && runStart < 0) {
+          runStart = n;
+        } else if (want == false && runStart >= 0) {
+          final long s = Math.max(runStart * nodeBytes, base) - base;
+          final long e = Math.min(n * nodeBytes - base, length);
+          if (e > s) {
+            slice.prefetch(s, e - s);
+          }
+          runStart = -1;
+        }
       }
+    }
+  }
+
+  /** A growable bit set keyed by node index. */
+  static final class FixedBitSetHolder {
+    private long[] bits = new long[1];
+
+    boolean getAndSet(long index) {
+      final int word = Math.toIntExact(index >>> 6);
+      if (word >= bits.length) {
+        bits = java.util.Arrays.copyOf(bits, Math.max(word + 1, bits.length * 2));
+      }
+      final long mask = 1L << (index & 63);
+      final boolean was = (bits[word] & mask) != 0;
+      bits[word] |= mask;
+      return was;
+    }
+
+    void reset() {
+      java.util.Arrays.fill(bits, 0L);
     }
   }
 

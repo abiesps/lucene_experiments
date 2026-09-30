@@ -45,6 +45,7 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.internal.vectorization.PostingDecodingUtil;
 import org.apache.lucene.search.DisjunctionPrefetch;
 import org.apache.lucene.search.DocAndFloatFeatureBuffer;
+import org.apache.lucene.search.TopKPrefetch;
 import org.apache.lucene.store.ByteArrayDataInput;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.DataInput;
@@ -521,6 +522,10 @@ public final class Lucene104DualNavPostingsReader extends PostingsReaderBase {
           navIn = Lucene104DualNavPostingsReader.this.navIn.clone();
         }
         prefetchPostings(docIn, termState);
+        if (docFreq >= BLOCK_SIZE && dualState.navStartFP >= 0 && TopKPrefetch.isEnabled()) {
+          // experimental: start loading this term's navigation data before the first skip
+          navIn.prefetch(dualState.navStartFP, 1);
+        }
       }
 
       if (forUtil == null && docFreq >= BLOCK_SIZE) {

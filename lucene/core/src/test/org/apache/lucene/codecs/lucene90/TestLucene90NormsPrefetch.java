@@ -71,7 +71,6 @@ public class TestLucene90NormsPrefetch extends LuceneTestCase {
 
           // random forward ranges, some overlapping the previous one
           int from = 0;
-          long requestedEnd = -1;
           while (from < maxDoc) {
             final int to = Math.min(maxDoc, from + 1 + random().nextInt(3 * (int) nodeBytes));
             assertTrue(norms.prefetchNodes(from, to, nodeBytes));
@@ -82,6 +81,7 @@ public class TestLucene90NormsPrefetch extends LuceneTestCase {
 
           final long regionEnd = regionStart + maxDoc; // 1 byte per norm here
           long covered = -1;
+          final List<long[]> seen = new ArrayList<>();
           for (long[] p : prefetches) {
             final long start = p[0];
             final long end = p[0] + p[1];
@@ -91,12 +91,50 @@ public class TestLucene90NormsPrefetch extends LuceneTestCase {
                 field + " unaligned start " + start,
                 start == regionStart || start % nodeBytes == 0);
             assertTrue(field + " unaligned end " + end, end == regionEnd || end % nodeBytes == 0);
-            assertTrue(field + " requested twice at " + start, start >= requestedEnd);
-            requestedEnd = end;
-            covered = end;
+            for (long[] q : seen) {
+              assertTrue(field + " requested twice at " + start, end <= q[0] || start >= q[1]);
+            }
+            seen.add(new long[] {start, end});
+            covered = Math.max(covered, end);
           }
           assertEquals(field + " did not cover all docs", regionEnd, covered);
         }
+      }
+    }
+  }
+
+  public void testGapsAreFilledLater() throws IOException {
+    final List<long[]> prefetches = new ArrayList<>();
+    try (Directory dir =
+        new PrefetchRecordingDirectory(newFSDirectory(createTempDir()), prefetches)) {
+      IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
+      iwc.setCodec(TestUtil.getDefaultCodec());
+      iwc.setUseCompoundFile(false);
+      try (IndexWriter w = new IndexWriter(dir, iwc)) {
+        for (int i = 0; i < 5000; i++) {
+          Document doc = new Document();
+          doc.add(new TextField("a", "x ".repeat(1 + i % 5), Field.Store.NO));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      try (DirectoryReader r = DirectoryReader.open(dir)) {
+        final NumericDocValues norms = getOnlyLeafReader(r).getNormValues("a");
+        prefetches.clear();
+        final long node = 256;
+        assertTrue(norms.prefetchNodes(2000, 2100, node)); // skip ahead: leaves a gap
+        assertTrue(norms.prefetchNodes(0, 5000, node)); // fills the gap and the rest
+        assertTrue(norms.prefetchNodes(0, 5000, node)); // nothing left
+        long total = 0;
+        final List<long[]> seen = new ArrayList<>();
+        for (long[] p : prefetches) {
+          for (long[] q : seen) {
+            assertTrue("requested twice at " + p[0], p[0] + p[1] <= q[0] || p[0] >= q[1]);
+          }
+          seen.add(new long[] {p[0], p[0] + p[1]});
+          total += p[1];
+        }
+        assertEquals("every norm byte requested exactly once", 5000, total);
       }
     }
   }
