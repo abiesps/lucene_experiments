@@ -504,6 +504,10 @@ public final class Lucene104DualNavPostingsReader extends PostingsReaderBase {
 
     public BlockPostingsEnum reset(DualNavTermState dualState, int flags) throws IOException {
       final IntBlockTermState termState = dualState.base;
+      planInitialized = false;
+      planTermDocStartFP = termState.docStartFP;
+      planTermNavStartFP = dualState.navStartFP;
+      planTermDocLength = dualState.docLength;
       docFreq = termState.docFreq;
       singletonDocID = termState.singletonDocID;
       if (docFreq > 1) {
@@ -1424,6 +1428,178 @@ public final class Lucene104DualNavPostingsReader extends PostingsReaderBase {
             return impactBuffer;
           }
         };
+
+    // ---- prefetch planning over .nav (see prefetchAhead); never moves the enum itself ----
+
+    /** Runs of planned blocks closer than this in .doc are prefetched as one range. */
+    private static final int PLAN_MERGE_GAP = 4096;
+
+    private static final int PLAN_MAX_CHECKPOINTS = 32;
+
+    private IndexInput planNav;
+    private boolean planInitialized;
+    private boolean planDone;
+    private long planTermDocStartFP;
+    private long planTermNavStartFP;
+    private long planTermDocLength;
+    private long
+        planDocFP; // .doc end of the last block the planner walked past (or the term start)
+    private int planLastDoc; // last doc ID of that block
+    private int planDocsLeft; // docs of the term the planner has not walked yet
+    private int planBlocksLeftInGroup; // level-0 entries left before the next level-1 entry
+    private long planConsumedFP; // approximate .doc position of the consumer
+    private long planRequestedFP; // .doc end of the last requested range
+    private long runStart = -1;
+    private long runEnd = -1;
+    // checkpoints (last doc ID, .doc end) of requested blocks, to track the consumer's position
+    private final int[] cpDoc = new int[PLAN_MAX_CHECKPOINTS];
+    private final long[] cpFP = new long[PLAN_MAX_CHECKPOINTS];
+    private int cpHead;
+    private int cpSize;
+
+    @Override
+    public int prefetchAhead(int fromDoc, long bytesAhead) throws IOException {
+      if (docFreq < BLOCK_SIZE || planTermDocLength < 0 || bytesAhead <= 0) {
+        // a single short block: reset() already prefetched its first page
+        return NO_MORE_DOCS;
+      }
+      if (planInitialized == false) {
+        if (planNav == null) {
+          planNav = Lucene104DualNavPostingsReader.this.navIn.clone();
+        }
+        planNav.seek(planTermNavStartFP);
+        planDocFP = planTermDocStartFP;
+        planLastDoc = -1;
+        planDocsLeft = docFreq;
+        planBlocksLeftInGroup = 0;
+        planConsumedFP = planTermDocStartFP;
+        planRequestedFP = planTermDocStartFP;
+        planDone = false;
+        cpHead = cpSize = 0;
+        runStart = runEnd = -1;
+        planInitialized = true;
+      }
+      // blocks whose last doc is before fromDoc have been consumed
+      while (cpSize > 0 && cpDoc[cpHead] < fromDoc) {
+        planConsumedFP = cpFP[cpHead];
+        cpHead = (cpHead + 1) % PLAN_MAX_CHECKPOINTS;
+        cpSize--;
+      }
+      if (cpSize == 0) {
+        planConsumedFP = Math.max(planConsumedFP, planRequestedFP);
+      }
+      final long checkpointEvery = Math.max(1, bytesAhead / 8);
+      long lastCheckpointFP = cpSize == 0 ? planConsumedFP : lastCheckpointFP();
+      while (planDone == false && planRequestedFP - planConsumedFP < bytesAhead) {
+        if (planStep(fromDoc) && planRequestedFP - lastCheckpointFP >= checkpointEvery) {
+          addCheckpoint(planLastDoc, planRequestedFP);
+          lastCheckpointFP = planRequestedFP;
+        }
+      }
+      flushRun();
+      if (cpSize > 0) {
+        return cpDoc[cpHead] + 1;
+      }
+      return planDone ? NO_MORE_DOCS : planLastDoc + 1;
+    }
+
+    private long lastCheckpointFP() {
+      return cpFP[(cpHead + cpSize - 1) % PLAN_MAX_CHECKPOINTS];
+    }
+
+    private void addCheckpoint(int lastDoc, long fp) {
+      if (cpSize == PLAN_MAX_CHECKPOINTS) {
+        return; // coarser tracking, still correct
+      }
+      final int i = (cpHead + cpSize) % PLAN_MAX_CHECKPOINTS;
+      cpDoc[i] = lastDoc;
+      cpFP[i] = fp;
+      cpSize++;
+    }
+
+    /**
+     * Walks one level-0 entry (or skips one level-1 group, or plans the tail block) of .nav.
+     *
+     * @return true if it requested a range
+     */
+    private boolean planStep(int fromDoc) throws IOException {
+      if (planDocsLeft < BLOCK_SIZE) {
+        // the vInt tail block follows the last full payload and ends the term
+        final long termEnd = planTermDocStartFP + planTermDocLength;
+        planDone = true;
+        if (planDocsLeft > 0 && termEnd > planDocFP) {
+          request(planDocFP, termEnd);
+          planLastDoc = NO_MORE_DOCS - 1;
+          return true;
+        }
+        return false;
+      }
+      if (planBlocksLeftInGroup == 0) {
+        if (planDocsLeft >= LEVEL1_NUM_DOCS) {
+          final int groupLastDoc = planLastDoc + planNav.readVInt();
+          final long navLength = planNav.readVLong();
+          final long groupNavEnd = planNav.getFilePointer() + navLength;
+          final long groupDocEnd = planDocFP + planNav.readVLong();
+          if (groupLastDoc < fromDoc) {
+            // the whole group is behind the consumer
+            planNav.seek(groupNavEnd);
+            planDocFP = groupDocEnd;
+            planLastDoc = groupLastDoc;
+            planDocsLeft -= LEVEL1_NUM_DOCS;
+            skipped(groupDocEnd);
+            return false;
+          }
+          if (indexHasFreq) {
+            final int level1SkipBytes = planNav.readShort();
+            planNav.seek(planNav.getFilePointer() + level1SkipBytes);
+          }
+          planBlocksLeftInGroup = Lucene104PostingsFormat.LEVEL1_FACTOR;
+        } else {
+          planBlocksLeftInGroup = planDocsLeft / BLOCK_SIZE;
+        }
+      }
+      final long entryLength = planNav.readVLong();
+      final long entryEnd = planNav.getFilePointer() + entryLength;
+      final int blockLastDoc = planLastDoc + readVInt15(planNav);
+      final long payloadStart = planDocFP + planNav.readVInt();
+      final long payloadEnd = payloadStart + readVLong15(planNav);
+      planNav.seek(entryEnd);
+      planDocFP = payloadEnd;
+      planLastDoc = blockLastDoc;
+      planDocsLeft -= BLOCK_SIZE;
+      planBlocksLeftInGroup--;
+      if (blockLastDoc < fromDoc) {
+        skipped(payloadEnd);
+        return false;
+      }
+      request(payloadStart, payloadEnd);
+      return true;
+    }
+
+    /** A block behind the consumer: it does not count against the budget. */
+    private void skipped(long endFP) throws IOException {
+      flushRun();
+      planConsumedFP = Math.max(planConsumedFP, endFP);
+      planRequestedFP = Math.max(planRequestedFP, endFP);
+    }
+
+    private void request(long start, long end) throws IOException {
+      if (runStart >= 0 && start - runEnd > PLAN_MERGE_GAP) {
+        flushRun();
+      }
+      if (runStart < 0) {
+        runStart = start;
+      }
+      runEnd = end;
+      planRequestedFP = end;
+    }
+
+    private void flushRun() throws IOException {
+      if (runStart >= 0) {
+        docIn.prefetch(runStart, runEnd - runStart);
+        runStart = runEnd = -1;
+      }
+    }
 
     @Override
     public Impacts getImpacts() {

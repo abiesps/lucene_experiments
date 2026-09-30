@@ -228,4 +228,24 @@ public abstract class DocIdSetIterator {
   public int docIDRunEnd() throws IOException {
     return docID() + 1;
   }
+
+  /**
+   * Optional hint: this iterator is about to be consumed from {@code fromDoc} onward, so it may
+   * start fetching the storage behind the next {@code bytesAhead} bytes of its data now, for
+   * example as concurrent prefetches. Calling it repeatedly with a growing {@code fromDoc} keeps a
+   * sliding window of about {@code bytesAhead} bytes in flight ahead of the consumer.
+   *
+   * <p>This does not change the position of the iterator.
+   *
+   * <p>The default implementation does nothing and returns {@link #NO_MORE_DOCS}.
+   *
+   * @param fromDoc the first doc ID the consumer still needs
+   * @param bytesAhead how many bytes of data to have requested ahead of {@code fromDoc}
+   * @return the doc ID at which calling this method again would request more data, or {@link
+   *     #NO_MORE_DOCS} if there is nothing more to request
+   * @lucene.experimental
+   */
+  public int prefetchAhead(int fromDoc, long bytesAhead) throws IOException {
+    return NO_MORE_DOCS;
+  }
 }

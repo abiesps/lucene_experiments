@@ -48,4 +48,9 @@ public class FilterDocIdSetIterator extends DocIdSetIterator {
   public long cost() {
     return in.cost();
   }
+
+  @Override
+  public int prefetchAhead(int fromDoc, long bytesAhead) throws IOException {
+    return in.prefetchAhead(fromDoc, bytesAhead);
+  }
 }

@@ -83,6 +83,12 @@ final class BooleanScorer extends BulkScorer {
   final boolean needsScores;
   private final DocAndFloatFeatureBuffer docAndScoreBuffer = new DocAndFloatFeatureBuffer();
 
+  // Experimental prefetching, see DisjunctionPrefetch: every clause, and the doc ID at which it
+  // asked
+  // to be called again.
+  private final DisiWrapper[] clauses;
+  private final int[] nextPrefetchDoc;
+
   BooleanScorer(Collection<Scorer> scorers, int minShouldMatch, boolean needsScores) {
     if (minShouldMatch < 1 || minShouldMatch > scorers.size()) {
       throw new IllegalArgumentException(
@@ -106,8 +112,12 @@ final class BooleanScorer extends BulkScorer {
     this.minShouldMatch = minShouldMatch;
     this.needsScores = needsScores;
     LongArrayList costs = new LongArrayList(scorers.size());
+    this.clauses = new DisiWrapper[scorers.size()];
+    this.nextPrefetchDoc = new int[scorers.size()];
+    int clause = 0;
     for (Scorer scorer : scorers) {
       DisiWrapper w = new DisiWrapper(scorer, false);
+      clauses[clause++] = w;
       costs.add(w.cost);
       final DisiWrapper evicted = tail.insertWithOverflow(w);
       if (evicted != null) {
@@ -320,13 +330,36 @@ final class BooleanScorer extends BulkScorer {
     }
   }
 
+  /** Tops up the prefetch window of every clause whose last request is running out. */
+  private void prefetch(int windowBase, long bytesAhead) throws IOException {
+    for (int i = 0; i < clauses.length; ++i) {
+      if (windowBase >= nextPrefetchDoc[i]) {
+        nextPrefetchDoc[i] = clauses[i].iterator.prefetchAhead(windowBase, bytesAhead);
+      }
+    }
+  }
+
   @Override
   public int score(LeafCollector collector, Bits acceptDocs, int min, int max) throws IOException {
     collector.setScorer(score);
 
-    DisiWrapper top = advance(min);
-    while (top.doc < max) {
-      top = scoreWindow(top, collector, acceptDocs, min, max);
+    final long bytesAhead = DisjunctionPrefetch.getBytesAhead();
+    DisiWrapper top;
+    if (bytesAhead > 0) {
+      // request the first stretch of every clause before the first (cold) reads
+      for (int i = 0; i < clauses.length; ++i) {
+        nextPrefetchDoc[i] = clauses[i].iterator.prefetchAhead(min, bytesAhead);
+      }
+      top = advance(min);
+      while (top.doc < max) {
+        prefetch(top.doc & ~MASK, bytesAhead);
+        top = scoreWindow(top, collector, acceptDocs, min, max);
+      }
+    } else {
+      top = advance(min);
+      while (top.doc < max) {
+        top = scoreWindow(top, collector, acceptDocs, min, max);
+      }
     }
 
     return top.doc;
