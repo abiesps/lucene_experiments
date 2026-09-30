@@ -43,6 +43,7 @@ import org.apache.lucene.index.IndexOptions;
 import org.apache.lucene.index.PostingsEnum;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.internal.vectorization.PostingDecodingUtil;
+import org.apache.lucene.search.DisjunctionPrefetch;
 import org.apache.lucene.search.DocAndFloatFeatureBuffer;
 import org.apache.lucene.store.ByteArrayDataInput;
 import org.apache.lucene.store.ChecksumIndexInput;
@@ -1463,7 +1464,15 @@ public final class Lucene104DualNavPostingsReader extends PostingsReaderBase {
         // a single short block: reset() already prefetched its first page
         return NO_MORE_DOCS;
       }
+      final long nodeBytes = DisjunctionPrefetch.getNodeBytes();
+      if (planInitialized && planNodeBytes != nodeBytes) {
+        planInitialized = false; // the mode changed between calls: start over
+      }
+      if (nodeBytes > 0) {
+        return prefetchAligned(fromDoc, Math.max(1, bytesAhead / nodeBytes), nodeBytes);
+      }
       if (planInitialized == false) {
+        planNodeBytes = 0;
         if (planNav == null) {
           planNav = Lucene104DualNavPostingsReader.this.navIn.clone();
         }
@@ -1599,6 +1608,135 @@ public final class Lucene104DualNavPostingsReader extends PostingsReaderBase {
         docIn.prefetch(runStart, runEnd - runStart);
         runStart = runEnd = -1;
       }
+    }
+
+    // ---- aligned mode (DisjunctionPrefetch.getNodeBytes() > 0): whole nodes, one node ahead ----
+
+    private long planNodeBytes; // node size the plan was initialized with, 0 for byte-budget mode
+    private boolean alHasBlock; // the cursor is on a postings block, described by alBlock*
+    private int alBlockFirstDoc;
+    private long alBlockStart;
+    private long alBlockEnd;
+
+    /**
+     * Requests whole nodes of {@code nodeBytes} (file offsets of .doc): the node the consumer is
+     * reading at {@code fromDoc} and {@code nodesAhead} more, and returns the first doc of the
+     * first postings block that reaches into the next node, where the next call is due.
+     */
+    private int prefetchAligned(int fromDoc, long nodesAhead, long nodeBytes) throws IOException {
+      final long termStart = planTermDocStartFP;
+      final long termEnd = termStart + planTermDocLength;
+      if (planInitialized == false) {
+        if (planNav == null) {
+          planNav = Lucene104DualNavPostingsReader.this.navIn.clone();
+        }
+        planNav.seek(planTermNavStartFP);
+        planDocFP = termStart;
+        planLastDoc = -1;
+        planDocsLeft = docFreq;
+        planBlocksLeftInGroup = 0;
+        planRequestedFP = termStart;
+        planDone = false;
+        alHasBlock = false;
+        planNodeBytes = nodeBytes;
+        planInitialized = true;
+      }
+      // move the cursor to the postings block that holds fromDoc
+      while (alHasBlock == false || planLastDoc < fromDoc) {
+        if (alignedStep(fromDoc, Long.MIN_VALUE) == false) {
+          return NO_MORE_DOCS; // fromDoc is past the last doc of the term
+        }
+      }
+      // The last node that reading this block touches. A postings block can cross a node boundary,
+      // so taking the node of its END (not its start) requests every node the block needs (two
+      // for a crossing block) before it is read, plus nodesAhead more.
+      final long node = (alBlockEnd - 1) / nodeBytes;
+      final long wantEnd = Math.min(termEnd, (node + 1 + nodesAhead) * nodeBytes);
+      // from the start of the node that holds this block (nodes behind it are consumed), or from
+      // where the previous request ended
+      final long start = Math.max(planRequestedFP, alBlockStart - alBlockStart % nodeBytes);
+      if (wantEnd > start) {
+        docIn.prefetch(start, wantEnd - start);
+      }
+      planRequestedFP = Math.max(planRequestedFP, wantEnd);
+      if (wantEnd >= termEnd) {
+        return NO_MORE_DOCS;
+      }
+      // call again at the first postings block that reaches into node + 1
+      final long boundary = (node + 1) * nodeBytes;
+      do {
+        if (alignedStep(Integer.MIN_VALUE, boundary) == false) {
+          return NO_MORE_DOCS;
+        }
+      } while (alHasBlock == false || alBlockEnd <= boundary);
+      return alBlockFirstDoc;
+    }
+
+    /**
+     * Moves the aligned cursor by one postings block, or over one whole level-1 group when all of
+     * its docs are before {@code skipDocsBefore} or all of its bytes end at or before {@code
+     * skipBytesUpTo} (then {@code alHasBlock} is false).
+     *
+     * @return false at the end of the term
+     */
+    private boolean alignedStep(int skipDocsBefore, long skipBytesUpTo) throws IOException {
+      if (planDone) {
+        return false;
+      }
+      if (planDocsLeft < BLOCK_SIZE) {
+        // the vInt tail block follows the last full payload and ends the term
+        final long termEnd = planTermDocStartFP + planTermDocLength;
+        planDone = true;
+        if (planDocsLeft == 0 || termEnd <= planDocFP) {
+          return false;
+        }
+        alBlockFirstDoc = planLastDoc + 1;
+        alBlockStart = planDocFP;
+        alBlockEnd = termEnd;
+        planDocFP = termEnd;
+        planLastDoc = NO_MORE_DOCS - 1;
+        planDocsLeft = 0;
+        alHasBlock = true;
+        return true;
+      }
+      if (planBlocksLeftInGroup == 0) {
+        if (planDocsLeft >= LEVEL1_NUM_DOCS) {
+          final int groupLastDoc = planLastDoc + planNav.readVInt();
+          final long navLength = planNav.readVLong();
+          final long groupNavEnd = planNav.getFilePointer() + navLength;
+          final long groupDocEnd = planDocFP + planNav.readVLong();
+          if (groupLastDoc < skipDocsBefore || groupDocEnd <= skipBytesUpTo) {
+            planNav.seek(groupNavEnd);
+            planDocFP = groupDocEnd;
+            planLastDoc = groupLastDoc;
+            planDocsLeft -= LEVEL1_NUM_DOCS;
+            alHasBlock = false;
+            return true;
+          }
+          if (indexHasFreq) {
+            final int level1SkipBytes = planNav.readShort();
+            planNav.seek(planNav.getFilePointer() + level1SkipBytes);
+          }
+          planBlocksLeftInGroup = Lucene104PostingsFormat.LEVEL1_FACTOR;
+        } else {
+          planBlocksLeftInGroup = planDocsLeft / BLOCK_SIZE;
+        }
+      }
+      final long entryLength = planNav.readVLong();
+      final long entryEnd = planNav.getFilePointer() + entryLength;
+      final int blockLastDoc = planLastDoc + readVInt15(planNav);
+      final long payloadStart = planDocFP + planNav.readVInt();
+      final long payloadEnd = payloadStart + readVLong15(planNav);
+      planNav.seek(entryEnd);
+      alBlockFirstDoc = planLastDoc + 1;
+      alBlockStart = payloadStart;
+      alBlockEnd = payloadEnd;
+      planDocFP = payloadEnd;
+      planLastDoc = blockLastDoc;
+      planDocsLeft -= BLOCK_SIZE;
+      planBlocksLeftInGroup--;
+      alHasBlock = true;
+      return true;
     }
 
     @Override

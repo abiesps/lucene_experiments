@@ -331,9 +331,24 @@ final class BooleanScorer extends BulkScorer {
   }
 
   /** Tops up the prefetch window of every clause whose last request is running out. */
-  private void prefetch(int windowBase, long bytesAhead) throws IOException {
+  private void prefetch(int windowBase, long bytesAhead, boolean aligned) throws IOException {
     for (int i = 0; i < clauses.length; ++i) {
-      if (windowBase >= nextPrefetchDoc[i]) {
+      if (aligned) {
+        // The call-again doc is where the clause starts reading its next node. Call as soon as
+        // that doc is inside the window about to be scored, so the node after it is requested
+        // before this window reads into it.
+        final int windowEnd = windowBase + SIZE;
+        while (nextPrefetchDoc[i] < windowEnd) {
+          final int from = Math.max(windowBase, nextPrefetchDoc[i]);
+          final int next = clauses[i].iterator.prefetchAhead(from, bytesAhead);
+          if (next <= from) {
+            // no progress: stop asking this clause (defensive, planners return a later doc)
+            nextPrefetchDoc[i] = DocIdSetIterator.NO_MORE_DOCS;
+            break;
+          }
+          nextPrefetchDoc[i] = next;
+        }
+      } else if (windowBase >= nextPrefetchDoc[i]) {
         nextPrefetchDoc[i] = clauses[i].iterator.prefetchAhead(windowBase, bytesAhead);
       }
     }
@@ -344,6 +359,7 @@ final class BooleanScorer extends BulkScorer {
     collector.setScorer(score);
 
     final long bytesAhead = DisjunctionPrefetch.getBytesAhead();
+    final boolean aligned = DisjunctionPrefetch.getNodeBytes() > 0;
     DisiWrapper top;
     if (bytesAhead > 0) {
       // request the first stretch of every clause before the first (cold) reads
@@ -352,7 +368,7 @@ final class BooleanScorer extends BulkScorer {
       }
       top = advance(min);
       while (top.doc < max) {
-        prefetch(top.doc & ~MASK, bytesAhead);
+        prefetch(top.doc & ~MASK, bytesAhead, aligned);
         top = scoreWindow(top, collector, acceptDocs, min, max);
       }
     } else {

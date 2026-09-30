@@ -57,6 +57,7 @@ public class TestLucene104DualNavPrefetch extends LuceneTestCase {
   public void tearDown() throws Exception {
     Lucene104DualNavPostingsFormat.setReadMode(ReadMode.DOC);
     DisjunctionPrefetch.setBytesAhead(0);
+    DisjunctionPrefetch.setNodeBytes(0);
     super.tearDown();
   }
 
@@ -207,6 +208,148 @@ public class TestLucene104DualNavPrefetch extends LuceneTestCase {
     }
   }
 
+  /**
+   * Aligned mode: requests are whole nodes (clipped to the term), never overlap, are issued one
+   * step at a time, and every .doc byte of the term is requested before it is read. OR counts do
+   * not change.
+   */
+  public void testAlignedPrefetch() throws IOException {
+    final Recorder recorder = new Recorder();
+    try (Directory dir = new RecordingDirectory(newFSDirectory(createTempDir()), recorder)) {
+      IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
+      iwc.setCodec(TestUtil.alwaysPostingsFormat(new Lucene104DualNavPostingsFormat()));
+      iwc.setUseCompoundFile(false);
+      final int numDocs = atLeast(80_000);
+      try (IndexWriter w = new IndexWriter(dir, iwc)) {
+        for (int i = 0; i < numDocs; i++) {
+          Document doc = new Document();
+          doc.add(new StringField("kw", "all", Field.Store.NO));
+          if (i % 2 == 0) doc.add(new StringField("kw", "half", Field.Store.NO));
+          if (i % 7 == 1) doc.add(new StringField("kw", "seventh", Field.Store.NO));
+          if (i % 301 == 3) doc.add(new StringField("kw", "sparse", Field.Store.NO));
+          w.addDocument(doc);
+        }
+        w.forceMerge(1);
+      }
+      Lucene104DualNavPostingsFormat.setReadMode(ReadMode.NAV);
+      try (DirectoryReader r = DirectoryReader.open(dir)) {
+        final LeafReader leaf = getOnlyLeafReader(r);
+        final String docFile = docFile(dir);
+        for (String term : new String[] {"all", "half", "seventh"}) {
+          final long nodeBytes = 1L << (9 + random().nextInt(5)); // 512 B .. 8 KiB
+          final long nodesAhead = 1 + random().nextInt(2);
+          checkAligned(leaf, term, docFile, recorder, nodeBytes, nodesAhead);
+        }
+        // each term spans several nodes, so some reads cross a boundary: the check above must
+        // have covered the case of one postings block needing two nodes
+        assertTrue("no read crossed a node boundary", crossingReads > 0);
+
+        // BooleanScorer in aligned mode returns the same counts
+        final IndexSearcher searcher = new IndexSearcher(r);
+        searcher.setQueryCache(null);
+        for (String[] terms :
+            // no clause may match every doc, or count() answers from term statistics without
+            // scoring
+            new String[][] {
+              {"half", "seventh"}, {"half", "sparse"}, {"half", "seventh", "sparse"}
+            }) {
+          BooleanQuery.Builder b = new BooleanQuery.Builder();
+          for (String t : terms) {
+            b.add(new TermQuery(new Term("kw", t)), BooleanClause.Occur.SHOULD);
+          }
+          final BooleanQuery q = b.build();
+          DisjunctionPrefetch.setNodeBytes(0);
+          DisjunctionPrefetch.setBytesAhead(0);
+          final int expected = searcher.count(q);
+          final long nodeBytes = 1L << (9 + random().nextInt(5));
+          DisjunctionPrefetch.setNodeBytes(nodeBytes);
+          DisjunctionPrefetch.setBytesAhead(nodeBytes);
+          recorder.reset();
+          assertEquals(
+              String.join(" OR ", terms) + " node=" + nodeBytes, expected, searcher.count(q));
+          assertFalse("no prefetch recorded", recorder.prefetches(docFile).isEmpty());
+        }
+      }
+    }
+  }
+
+  private void checkAligned(
+      LeafReader leaf,
+      String term,
+      String docFile,
+      Recorder recorder,
+      long maxNodeBytes,
+      long nodesAhead)
+      throws IOException {
+    final TermsEnum te = leaf.terms("kw").iterator();
+    assertTrue(te.seekExact(new BytesRef(term)));
+    final DualNavTermState state = (DualNavTermState) te.termState();
+    long nodeBytes = maxNodeBytes;
+    while (state.docLength <= 4 * nodeBytes && nodeBytes > 64) {
+      nodeBytes >>= 1; // keep several nodes per term
+    }
+    if (state.docLength <= 4 * nodeBytes) {
+      return; // e.g. a term whose blocks compress to almost nothing
+    }
+    DisjunctionPrefetch.setNodeBytes(nodeBytes);
+    final long bytesAhead = nodesAhead * nodeBytes;
+    final long termStart = state.base.docStartFP;
+    final long termEnd = termStart + state.docLength;
+    final String msg = term + " node=" + nodeBytes + " ahead=" + nodesAhead;
+
+    final List<Integer> expected = new ArrayList<>();
+    final PostingsEnum plain = te.postings(null, PostingsEnum.NONE);
+    for (int doc = plain.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = plain.nextDoc()) {
+      expected.add(doc);
+    }
+
+    recorder.reset();
+    final PostingsEnum pe = te.postings(null, PostingsEnum.NONE);
+    final List<Integer> actual = new ArrayList<>();
+    int callAgain = pe.prefetchAhead(0, bytesAhead);
+    for (int doc = pe.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = pe.nextDoc()) {
+      actual.add(doc);
+      // the next nextDoc() may start reading the block of doc + 1
+      while (callAgain != DocIdSetIterator.NO_MORE_DOCS && doc + 1 >= callAgain) {
+        final int next = pe.prefetchAhead(doc + 1, bytesAhead);
+        assertTrue(msg + " call-again must move forward", next > doc + 1);
+        callAgain = next;
+      }
+    }
+    assertEquals(msg, expected, actual);
+
+    long requested = 0;
+    final List<long[]> prefetches = new ArrayList<>();
+    for (long[] p : recorder.prefetches(docFile)) {
+      if (p[1] == 1 && p[0] == termStart) {
+        continue; // the stock one-byte prefetch of the term start done by reset()
+      }
+      prefetches.add(p);
+      final long start = p[0];
+      final long end = p[0] + p[1];
+      assertTrue(msg + " prefetch " + start + "+" + p[1], start >= termStart && end <= termEnd);
+      assertTrue(msg + " unaligned start " + start, start == termStart || start % nodeBytes == 0);
+      assertTrue(msg + " unaligned end " + end, end == termEnd || end % nodeBytes == 0);
+      requested += p[1];
+    }
+    assertTrue(msg + " requested bytes overlap: " + requested, requested <= termEnd - termStart);
+    assertTrue(msg + " planned all at once", prefetches.size() >= 2);
+    for (long[] read : recorder.reads(docFile)) {
+      if (read[0] < termStart || read[0] >= termEnd) {
+        continue;
+      }
+      // a read that crosses a node boundary needs both nodes requested before it
+      if (read[1] > 0 && read[0] / nodeBytes != (read[0] + read[1] - 1) / nodeBytes) {
+        crossingReads++;
+      }
+      assertTrue(
+          msg + " read " + read[0] + "+" + read[1] + " not prefetched before",
+          recorder.coveredByUnionBefore(docFile, read[0], read[1], read[2]));
+    }
+  }
+
+  private int crossingReads;
+
   public void testPrefetchCoversReadsAndStaysInTerm() throws IOException {
     final Recorder recorder = new Recorder();
     try (Directory dir = new RecordingDirectory(newFSDirectory(createTempDir()), recorder)) {
@@ -350,6 +493,22 @@ public class TestLucene104DualNavPrefetch extends LuceneTestCase {
     /**
      * True if [pos, pos+len) lies inside one prefetch recorded before sequence number seqOfRead.
      */
+    /** True if [pos, pos+len) lies inside the union of prefetches recorded before seqOfRead. */
+    synchronized boolean coveredByUnionBefore(String file, long pos, long len, long seqOfRead) {
+      long covered = pos;
+      boolean progress = true;
+      while (covered < pos + len && progress) {
+        progress = false;
+        for (long[] p : prefetches(file)) {
+          if (p[2] < seqOfRead && p[0] <= covered && covered < p[0] + p[1]) {
+            covered = p[0] + p[1];
+            progress = true;
+          }
+        }
+      }
+      return covered >= pos + len;
+    }
+
     synchronized boolean coveredBefore(String file, long pos, long len, long seqOfRead) {
       for (long[] p : prefetches(file)) {
         if (p[2] < seqOfRead && p[0] <= pos && pos + len <= p[0] + p[1]) {

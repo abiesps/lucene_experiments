@@ -44,4 +44,28 @@ public final class DisjunctionPrefetch {
   public static long getBytesAhead() {
     return bytesAhead;
   }
+
+  private static volatile long nodeBytes;
+
+  /**
+   * Aligned mode: when positive, iterators that support it plan prefetches in whole nodes of this
+   * many bytes (the storage block size, for example the cache block size), counted from the start
+   * of the file. When a clause starts reading node k, nodes up to k + bytesAhead / nodeBytes (at
+   * least k + 1) are requested, and the clause asks to be called again at the first doc whose
+   * postings reach node k + 1. 0 (the default) keeps the byte-budget mode.
+   *
+   * <p>Offsets are file offsets of the postings file, so nodes line up with storage blocks only
+   * when that file is not inside a compound file.
+   */
+  public static void setNodeBytes(long bytes) {
+    if (bytes < 0) {
+      throw new IllegalArgumentException("bytes must be >= 0, got " + bytes);
+    }
+    nodeBytes = bytes;
+  }
+
+  /** Returns the node size of aligned mode, 0 when aligned mode is off. */
+  public static long getNodeBytes() {
+    return nodeBytes;
+  }
 }
