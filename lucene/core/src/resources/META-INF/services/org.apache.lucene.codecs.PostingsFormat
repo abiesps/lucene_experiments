@@ -15,3 +15,4 @@
 
 org.apache.lucene.codecs.lucene104.Lucene104PostingsFormat
 org.apache.lucene.codecs.lucene104.Lucene104NavPostingsFormat
+org.apache.lucene.codecs.lucene104.Lucene104DualNavPostingsFormat
