@@ -878,6 +878,12 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
                 int valuesOffset,
                 long defaultValue)
                 throws IOException {
+              if (CollectExperiments.isBulkDecode() && size > 0) {
+                // dense: every doc has a value, so defaultValue is never used
+                vBPVReader.getLongValues(size, docs, docsOffset, values, valuesOffset);
+                doc = docs[docsOffset + size - 1];
+                return;
+              }
               // Delegate to help performance: when the super call inlines, calls to
               // #advanceExact/#longValue become monomorphic.
               super.longValues(size, docs, docsOffset, values, valuesOffset, defaultValue);
@@ -1411,6 +1417,42 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           @Override
           public int ordValue() throws IOException {
             return (int) values.get(doc);
+          }
+
+          private final SpanScratch scratch = new SpanScratch();
+
+          @Override
+          public void ordValues(int size, int[] docs, int[] ords) throws IOException {
+            if (size == 0) {
+              return;
+            }
+            // dense: every doc has an ordinal
+            final int first = docs[0];
+            final int span = docs[size - 1] - first + 1;
+            if (CollectExperiments.isBulkDecode()
+                && span <= (long) size * PackedSpans.MAX_SPAN_PER_DOC) {
+              if (scratch.values.length < span) {
+                scratch.values = new long[span];
+              }
+              scratch.bytes =
+                  PackedSpans.decode(
+                      slice,
+                      0L,
+                      ordsEntry.bitsPerValue,
+                      first,
+                      span,
+                      scratch.values,
+                      scratch.bytes);
+              final long[] decoded = scratch.values;
+              for (int i = 0; i < size; i++) {
+                ords[i] = (int) decoded[docs[i] - first];
+              }
+            } else {
+              for (int i = 0; i < size; i++) {
+                ords[i] = (int) values.get(docs[i]);
+              }
+            }
+            doc = docs[size - 1];
           }
 
           @Override

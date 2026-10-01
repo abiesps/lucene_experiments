@@ -20,11 +20,13 @@ import java.io.IOException;
 import java.util.function.LongUnaryOperator;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.NumericDocValuesField;
+import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.NumericDocValues;
+import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.search.CollectExperiments;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
@@ -33,6 +35,7 @@ import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.tests.util.TestUtil;
+import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.LongValues;
 import org.apache.lucene.util.packed.DirectReader;
 import org.apache.lucene.util.packed.DirectWriter;
@@ -151,6 +154,50 @@ public class TestLucene90BulkDecode extends LuceneTestCase {
                 assertEquals(expected[next], dv.longValue());
                 doc = Math.max(doc, next + 1);
               }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  public void testDenseSortedOrdValues() throws IOException {
+    try (Directory dir = newDirectory()) {
+      int maxDoc = TestUtil.nextInt(random(), 20_000, 60_000);
+      int numTerms = TestUtil.nextInt(random(), 2, 3000);
+      String[] terms = new String[maxDoc];
+      IndexWriterConfig config = new IndexWriterConfig().setCodec(TestUtil.getDefaultCodec());
+      try (IndexWriter w = new IndexWriter(dir, config)) {
+        for (int doc = 0; doc < maxDoc; doc++) {
+          terms[doc] = "t" + random().nextInt(numTerms);
+          Document d = new Document();
+          d.add(new SortedDocValuesField("f", new BytesRef(terms[doc])));
+          w.addDocument(d);
+        }
+        w.forceMerge(1);
+      }
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        LeafReader leaf = getOnlyLeafReader(reader);
+        for (boolean bulk : new boolean[] {false, true}) {
+          CollectExperiments.setBulkDecode(bulk);
+          SortedDocValues dv = leaf.getSortedDocValues("f");
+          SortedDocValues lookup = leaf.getSortedDocValues("f");
+          int[] docs = new int[1024];
+          int[] ords = new int[1024];
+          int doc = 0;
+          while (doc < maxDoc) {
+            int step = random().nextInt(3) == 0 ? 1 : TestUtil.nextInt(random(), 1, 40);
+            int n = 0;
+            for (; n < docs.length && doc < maxDoc; n++) {
+              docs[n] = doc;
+              doc += TestUtil.nextInt(random(), 1, step);
+            }
+            dv.ordValues(n, docs, ords);
+            for (int i = 0; i < n; i++) {
+              assertEquals(
+                  "bulk=" + bulk + " doc=" + docs[i],
+                  terms[docs[i]],
+                  lookup.lookupOrd(ords[i]).utf8ToString());
             }
           }
         }

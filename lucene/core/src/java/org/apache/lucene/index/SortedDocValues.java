@@ -43,6 +43,28 @@ public abstract class SortedDocValues extends DocValuesIterator {
   public abstract int ordValue() throws IOException;
 
   /**
+   * Experimental bulk retrieval of ordinals: {@code ords[i]} is the ordinal of {@code docs[i]}, or
+   * {@code -1} when that doc has no value, for {@code i < size}. Behaves as if implemented as
+   * below, which is the default implementation:
+   *
+   * <pre class="prettyprint">
+   * for (int i = 0; i &lt; size; ++i) {
+   *   ords[i] = advanceExact(docs[i]) ? ordValue() : -1;
+   * }
+   * </pre>
+   *
+   * <p><b>NOTE</b>: The {@code docs} array is required to be sorted in ascending order with no
+   * duplicates, and the first doc must not be before the current doc.
+   *
+   * @lucene.experimental
+   */
+  public void ordValues(int size, int[] docs, int[] ords) throws IOException {
+    for (int i = 0; i < size; ++i) {
+      ords[i] = advanceExact(docs[i]) ? ordValue() : -1;
+    }
+  }
+
+  /**
    * Retrieves the value for the specified ordinal. The returned {@link BytesRef} may be re-used
    * across calls to {@link #lookupOrd(int)} so make sure to {@link BytesRef#deepCopyOf(BytesRef)
    * copy it} if you want to keep it around.
