@@ -24,8 +24,25 @@ package org.apache.lucene.search;
  */
 public final class CollectExperiments {
   private static volatile boolean cacheRunEnd;
+  private static volatile boolean bulkDecode;
 
   private CollectExperiments() {}
+
+  /**
+   * Sets whether bulk doc-values reads ({@link
+   * org.apache.lucene.index.NumericDocValues#longValues(int, int[], long[], long)}) of dense
+   * Lucene90 numeric fields decode the packed values between the first and the last requested doc
+   * in one pass and pick the requested ones, instead of reading one value per doc. Applies when the
+   * docs are dense enough within the span; read on every call.
+   */
+  public static void setBulkDecode(boolean on) {
+    bulkDecode = on;
+  }
+
+  /** Returns whether bulk doc-values reads decode spans. */
+  public static boolean isBulkDecode() {
+    return bulkDecode;
+  }
 
   /**
    * Sets whether {@link DenseConjunctionBulkScorer} keeps each clause's last {@link

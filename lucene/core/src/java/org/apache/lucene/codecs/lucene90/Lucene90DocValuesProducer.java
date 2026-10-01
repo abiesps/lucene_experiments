@@ -43,6 +43,7 @@ import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.index.TermsEnum.SeekStatus;
 import org.apache.lucene.internal.hppc.IntObjectHashMap;
+import org.apache.lucene.search.CollectExperiments;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.ByteArrayDataInput;
 import org.apache.lucene.store.ChecksumIndexInput;
@@ -467,7 +468,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       DOC_VALUES_RANGE_SUPPORT =
           org.apache.lucene.internal.vectorization.VectorizationProvider.getInstance()
               .getDocValuesRangeSupport();
-  private static final org.apache.lucene.internal.vectorization.DocValuesBulkDecodeSupport
+  static final org.apache.lucene.internal.vectorization.DocValuesBulkDecodeSupport
       DOC_VALUES_BULK_DECODE_SUPPORT =
           org.apache.lucene.internal.vectorization.VectorizationProvider.getInstance()
               .getDocValuesBulkDecodeSupport();
@@ -598,6 +599,48 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     for (int i = valuesOffset, end = valuesOffset + size; i < end; i++) {
       values[i] = mul * values[i] + delta;
     }
+  }
+
+  /** Scratch buffers of {@link #spanDecodeRaw}, one per doc values instance. */
+  private static final class SpanScratch {
+    long[] values = new long[0];
+    byte[] bytes = new byte[0];
+  }
+
+  /**
+   * Experimental bulk read of a dense, non-blocked numeric field (see {@link
+   * CollectExperiments#isBulkDecode()}): decodes the packed values between the first and the last
+   * requested doc in one pass and picks the requested ones. Writes raw packed values; the caller
+   * applies the table or gcd/delta.
+   *
+   * @return false, writing nothing, when the docs are too sparse within their span
+   */
+  private static boolean spanDecodeRaw(
+      RandomAccessInput slice,
+      NumericEntry entry,
+      int size,
+      int[] docs,
+      int docsOffset,
+      long[] values,
+      int valuesOffset,
+      SpanScratch scratch)
+      throws IOException {
+    final int first = docs[docsOffset];
+    final int span = docs[docsOffset + size - 1] - first + 1;
+    if (span > (long) size * PackedSpans.MAX_SPAN_PER_DOC) {
+      return false;
+    }
+    if (scratch.values.length < span) {
+      scratch.values = new long[span];
+    }
+    scratch.bytes =
+        PackedSpans.decode(
+            slice, 0L, entry.bitsPerValue, first, span, scratch.values, scratch.bytes);
+    final long[] decoded = scratch.values;
+    for (int k = 0; k < size; k++) {
+      values[valuesOffset + k] = decoded[docs[docsOffset + k] - first];
+    }
+    return true;
   }
 
   private static class NumericEntry {
@@ -847,6 +890,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             final long[] table = entry.table;
             return new DenseNumericDocValues(maxDoc) {
               private byte[] bulkBytes = new byte[0];
+              private final SpanScratch scratch = new SpanScratch();
 
               @Override
               public long longValue() throws IOException {
@@ -866,7 +910,15 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
                     bulkDecodeByteAlignedValues(
                         slice, entry, size, docs, docsOffset, values, valuesOffset, bulkBytes);
                 if (bytes == null) {
-                  super.longValues(size, docs, docsOffset, values, valuesOffset, defaultValue);
+                  if (CollectExperiments.isBulkDecode()
+                      && size > 0
+                      && spanDecodeRaw(
+                          slice, entry, size, docs, docsOffset, values, valuesOffset, scratch)) {
+                    applyTable(values, valuesOffset, table, size);
+                    doc = docs[docsOffset + size - 1];
+                  } else {
+                    super.longValues(size, docs, docsOffset, values, valuesOffset, defaultValue);
+                  }
                 } else {
                   applyTable(values, valuesOffset, table, size);
                   bulkBytes = bytes;
@@ -880,6 +932,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             // Common case for ordinals, which are encoded as numerics
             return new DenseNumericDocValues(maxDoc) {
               private byte[] bulkBytes = new byte[0];
+              private final SpanScratch scratch = new SpanScratch();
 
               @Override
               public long longValue() throws IOException {
@@ -899,7 +952,14 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
                     bulkDecodeByteAlignedValues(
                         slice, entry, size, docs, docsOffset, values, valuesOffset, bulkBytes);
                 if (bytes == null) {
-                  super.longValues(size, docs, docsOffset, values, valuesOffset, defaultValue);
+                  if (CollectExperiments.isBulkDecode()
+                      && size > 0
+                      && spanDecodeRaw(
+                          slice, entry, size, docs, docsOffset, values, valuesOffset, scratch)) {
+                    doc = docs[docsOffset + size - 1];
+                  } else {
+                    super.longValues(size, docs, docsOffset, values, valuesOffset, defaultValue);
+                  }
                 } else {
                   bulkBytes = bytes;
                   if (size != 0) {
@@ -926,6 +986,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             final long delta = entry.minValue;
             return new DenseNumericDocValues(maxDoc) {
               private byte[] bulkBytes = new byte[0];
+              private final SpanScratch scratch = new SpanScratch();
 
               @Override
               public long longValue() throws IOException {
@@ -945,7 +1006,15 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
                     bulkDecodeByteAlignedValues(
                         slice, entry, size, docs, docsOffset, values, valuesOffset, bulkBytes);
                 if (bytes == null) {
-                  super.longValues(size, docs, docsOffset, values, valuesOffset, defaultValue);
+                  if (CollectExperiments.isBulkDecode()
+                      && size > 0
+                      && spanDecodeRaw(
+                          slice, entry, size, docs, docsOffset, values, valuesOffset, scratch)) {
+                    applyGcdDelta(values, valuesOffset, mul, delta, size);
+                    doc = docs[docsOffset + size - 1];
+                  } else {
+                    super.longValues(size, docs, docsOffset, values, valuesOffset, defaultValue);
+                  }
                 } else {
                   applyGcdDelta(values, valuesOffset, mul, delta, size);
                   bulkBytes = bytes;
@@ -2333,6 +2402,62 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     long getLongValue(long index) throws IOException {
       final long block = index >>> shift;
       if (this.block != block) {
+        loadBlock(block);
+      }
+      return mul * values.get(index & mask) + delta;
+    }
+
+    /**
+     * Bulk variant of {@link #getLongValue}: {@code out[outOffset + i] = value of docs[docsOffset +
+     * i]}, for sorted doc IDs. Docs are grouped by value block; in a group dense enough (at least
+     * one requested doc per {@link PackedSpans#MAX_SPAN_PER_DOC} values of the span between its
+     * first and last doc), the span is decoded in one pass and the requested values are picked from
+     * it. Sparser groups read one value per doc.
+     */
+    void getLongValues(int size, int[] docs, int docsOffset, long[] out, int outOffset)
+        throws IOException {
+      int i = docsOffset;
+      final int end = docsOffset + size;
+      while (i < end) {
+        final long block = docs[i] >>> shift;
+        int j = i + 1;
+        while (j < end && (docs[j] >>> shift) == block) {
+          j++;
+        }
+        if (this.block != block) {
+          loadBlock(block);
+        }
+        final int count = j - i;
+        final int first = docs[i] & mask;
+        final int span = (docs[j - 1] & mask) - first + 1;
+        final int o = outOffset + (i - docsOffset);
+        if (bitsPerValue == 0) {
+          Arrays.fill(out, o, o + count, delta);
+        } else if (span <= (long) count * PackedSpans.MAX_SPAN_PER_DOC) {
+          if (spanValues.length < span) {
+            spanValues = new long[1 << shift];
+          }
+          spanBytes =
+              PackedSpans.decode(slice, offset, bitsPerValue, first, span, spanValues, spanBytes);
+          final long[] decoded = spanValues;
+          for (int k = 0; k < count; k++) {
+            out[o + k] = mul * decoded[(docs[i + k] & mask) - first] + delta;
+          }
+        } else {
+          for (int k = 0; k < count; k++) {
+            out[o + k] = mul * values.get(docs[i + k] & mask) + delta;
+          }
+        }
+        i = j;
+      }
+    }
+
+    private long[] spanValues = new long[0];
+    private byte[] spanBytes = new byte[0];
+    private int bitsPerValue;
+
+    private void loadBlock(long block) throws IOException {
+      {
         int bitsPerValue;
         do {
           // If the needed block is the one directly following the current block, it is cheaper to
@@ -2360,8 +2485,8 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             bitsPerValue == 0
                 ? LongValues.ZEROES
                 : getDirectReaderInstance(slice, bitsPerValue, offset, numValues);
+        this.bitsPerValue = bitsPerValue;
       }
-      return mul * values.get(index & mask) + delta;
     }
   }
 
