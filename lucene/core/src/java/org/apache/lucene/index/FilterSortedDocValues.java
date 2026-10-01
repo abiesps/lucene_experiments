@@ -87,4 +87,19 @@ public abstract class FilterSortedDocValues extends SortedDocValues {
   public long cost() {
     return in.cost();
   }
+
+  @Override
+  public boolean prefetchNodes(int fromDoc, int toDoc, long nodeBytes) throws IOException {
+    return in.prefetchNodes(fromDoc, toDoc, nodeBytes);
+  }
+
+  @Override
+  public int nextPrefetchNodeDoc(int doc, long nodeBytes) throws IOException {
+    return in.nextPrefetchNodeDoc(doc, nodeBytes);
+  }
+
+  @Override
+  public void ordValues(int size, int[] docs, int[] ords) throws IOException {
+    in.ordValues(size, docs, ords);
+  }
 }

@@ -65,6 +65,26 @@ public abstract class SortedDocValues extends DocValuesIterator {
   }
 
   /**
+   * Experimental prefetch hint: requests, in whole nodes of {@code nodeBytes} bytes, the stored
+   * ordinals of docs in {@code [fromDoc, toDoc)}. See {@link NumericDocValues#prefetchNodes}.
+   *
+   * @return true if this instance supports the hint
+   * @lucene.experimental
+   */
+  public boolean prefetchNodes(int fromDoc, int toDoc, long nodeBytes) throws IOException {
+    return false;
+  }
+
+  /**
+   * Experimental: see {@link NumericDocValues#nextPrefetchNodeDoc}; -1 if unsupported.
+   *
+   * @lucene.experimental
+   */
+  public int nextPrefetchNodeDoc(int doc, long nodeBytes) throws IOException {
+    return -1;
+  }
+
+  /**
    * Retrieves the value for the specified ordinal. The returned {@link BytesRef} may be re-used
    * across calls to {@link #lookupOrd(int)} so make sure to {@link BytesRef#deepCopyOf(BytesRef)
    * copy it} if you want to keep it around.

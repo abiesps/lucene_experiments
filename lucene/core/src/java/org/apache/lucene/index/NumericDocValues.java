@@ -98,6 +98,19 @@ public abstract class NumericDocValues extends DocValuesIterator {
   }
 
   /**
+   * Experimental: returns the first doc ID whose stored value starts in a node of {@code nodeBytes}
+   * bytes after the node holding the start of {@code doc}'s value, {@link
+   * org.apache.lucene.search.DocIdSetIterator#NO_MORE_DOCS} if there is none, or -1 if this
+   * instance does not support node planning (the default). Does not move the iterator. Together
+   * with {@link #prefetchNodes} it lets a caller request exactly the next node that will be read.
+   *
+   * @lucene.experimental
+   */
+  public int nextPrefetchNodeDoc(int doc, long nodeBytes) throws IOException {
+    return -1;
+  }
+
+  /**
    * Offset-aware variant of {@link #longValues(int, int[], long[], long)}. Reads {@code size} doc
    * IDs starting at {@code docs[docsOffset]} and writes the corresponding values starting at {@code
    * values[valuesOffset]}. This follows the same convention as {@link System#arraycopy}.

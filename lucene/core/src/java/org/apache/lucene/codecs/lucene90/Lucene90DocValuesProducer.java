@@ -864,6 +864,40 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           // dense but split into blocks of different bits per value
           return new DenseNumericDocValues(maxDoc) {
             final VaryingBPVReader vBPVReader = new VaryingBPVReader(entry, slice);
+            private DocValuesNodes nodes;
+
+            private DocValuesNodes nodes() throws IOException {
+              if (nodes == null && entry.valueJumpTableOffset >= 0) {
+                nodes =
+                    DocValuesNodes.blocked(
+                        slice,
+                        entry.valuesOffset,
+                        entry.valuesLength,
+                        maxDoc,
+                        data.randomAccessSlice(
+                            entry.valueJumpTableOffset, data.length() - entry.valueJumpTableOffset),
+                        entry.blockShift,
+                        entry.numValues);
+              }
+              return nodes;
+            }
+
+            @Override
+            public boolean prefetchNodes(int fromDoc, int toDoc, long nodeBytes)
+                throws IOException {
+              final DocValuesNodes n = nodes();
+              if (n == null) {
+                return false;
+              }
+              n.prefetch(fromDoc, toDoc, nodeBytes);
+              return true;
+            }
+
+            @Override
+            public int nextPrefetchNodeDoc(int doc, long nodeBytes) throws IOException {
+              final DocValuesNodes n = nodes();
+              return n == null ? -1 : n.nextNodeDoc(doc, nodeBytes);
+            }
 
             @Override
             public long longValue() throws IOException {
@@ -898,6 +932,32 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             return new DenseNumericDocValues(maxDoc) {
               private byte[] bulkBytes = new byte[0];
               private final SpanScratch scratch = new SpanScratch();
+              private DocValuesNodes nodes;
+
+              private DocValuesNodes nodes() {
+                if (nodes == null) {
+                  nodes =
+                      DocValuesNodes.packed(
+                          slice,
+                          entry.valuesOffset,
+                          entry.valuesLength,
+                          maxDoc,
+                          entry.bitsPerValue);
+                }
+                return nodes;
+              }
+
+              @Override
+              public boolean prefetchNodes(int fromDoc, int toDoc, long nodeBytes)
+                  throws IOException {
+                nodes().prefetch(fromDoc, toDoc, nodeBytes);
+                return true;
+              }
+
+              @Override
+              public int nextPrefetchNodeDoc(int doc, long nodeBytes) throws IOException {
+                return nodes().nextNodeDoc(doc, nodeBytes);
+              }
 
               @Override
               public long longValue() throws IOException {
@@ -940,6 +1000,32 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             return new DenseNumericDocValues(maxDoc) {
               private byte[] bulkBytes = new byte[0];
               private final SpanScratch scratch = new SpanScratch();
+              private DocValuesNodes nodes;
+
+              private DocValuesNodes nodes() {
+                if (nodes == null) {
+                  nodes =
+                      DocValuesNodes.packed(
+                          slice,
+                          entry.valuesOffset,
+                          entry.valuesLength,
+                          maxDoc,
+                          entry.bitsPerValue);
+                }
+                return nodes;
+              }
+
+              @Override
+              public boolean prefetchNodes(int fromDoc, int toDoc, long nodeBytes)
+                  throws IOException {
+                nodes().prefetch(fromDoc, toDoc, nodeBytes);
+                return true;
+              }
+
+              @Override
+              public int nextPrefetchNodeDoc(int doc, long nodeBytes) throws IOException {
+                return nodes().nextNodeDoc(doc, nodeBytes);
+              }
 
               @Override
               public long longValue() throws IOException {
@@ -994,6 +1080,32 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             return new DenseNumericDocValues(maxDoc) {
               private byte[] bulkBytes = new byte[0];
               private final SpanScratch scratch = new SpanScratch();
+              private DocValuesNodes nodes;
+
+              private DocValuesNodes nodes() {
+                if (nodes == null) {
+                  nodes =
+                      DocValuesNodes.packed(
+                          slice,
+                          entry.valuesOffset,
+                          entry.valuesLength,
+                          maxDoc,
+                          entry.bitsPerValue);
+                }
+                return nodes;
+              }
+
+              @Override
+              public boolean prefetchNodes(int fromDoc, int toDoc, long nodeBytes)
+                  throws IOException {
+                nodes().prefetch(fromDoc, toDoc, nodeBytes);
+                return true;
+              }
+
+              @Override
+              public int nextPrefetchNodeDoc(int doc, long nodeBytes) throws IOException {
+                return nodes().nextNodeDoc(doc, nodeBytes);
+              }
 
               @Override
               public long longValue() throws IOException {
@@ -1422,6 +1534,31 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
           private final SpanScratch scratch = new SpanScratch();
           private long[] ordScratch = new long[0];
+          private DocValuesNodes nodes;
+
+          private DocValuesNodes nodes() {
+            if (nodes == null) {
+              nodes =
+                  DocValuesNodes.packed(
+                      slice,
+                      ordsEntry.valuesOffset,
+                      ordsEntry.valuesLength,
+                      maxDoc,
+                      ordsEntry.bitsPerValue);
+            }
+            return nodes;
+          }
+
+          @Override
+          public boolean prefetchNodes(int fromDoc, int toDoc, long nodeBytes) throws IOException {
+            nodes().prefetch(fromDoc, toDoc, nodeBytes);
+            return true;
+          }
+
+          @Override
+          public int nextPrefetchNodeDoc(int doc, long nodeBytes) throws IOException {
+            return nodes().nextNodeDoc(doc, nodeBytes);
+          }
 
           @Override
           public void ordValues(int size, int[] docs, int[] ords) throws IOException {
@@ -2550,6 +2687,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     final IndexInput input = skipperSource.slice("doc value skipper", entry.offset, entry.length);
     // TODO: should we write to disk the actual max level for this segment?
     return new DocValuesSkipper() {
+      @Override
+      public void prefetch() throws IOException {
+        input.prefetch(0, input.length());
+      }
+
       final int[] minDocID = new int[SKIP_INDEX_MAX_LEVEL];
       final int[] maxDocID = new int[SKIP_INDEX_MAX_LEVEL];
 

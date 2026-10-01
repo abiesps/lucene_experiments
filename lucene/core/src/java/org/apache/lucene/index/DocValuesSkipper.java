@@ -29,6 +29,14 @@ import org.apache.lucene.search.DocIdSetIterator;
 public abstract class DocValuesSkipper {
 
   /**
+   * Experimental prefetch hint: requests all the data of this skipper, so that later {@link
+   * #advance} calls do not wait on storage. The default does nothing.
+   *
+   * @lucene.experimental
+   */
+  public void prefetch() throws IOException {}
+
+  /**
    * Advance this skipper so that all levels contain the next document on or after {@code target}.
    *
    * <p><b>NOTE</b>: The behavior is undefined if {@code target} is less than or equal to {@code
