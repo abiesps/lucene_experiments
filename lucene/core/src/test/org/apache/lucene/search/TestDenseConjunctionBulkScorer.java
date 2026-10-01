@@ -23,10 +23,77 @@ import java.util.List;
 import org.apache.lucene.tests.search.AssertingBulkScorer;
 import org.apache.lucene.tests.search.RandomApproximationQuery.RandomTwoPhaseView;
 import org.apache.lucene.tests.util.LuceneTestCase;
+import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 
 public class TestDenseConjunctionBulkScorer extends LuceneTestCase {
+
+  @Override
+  public void setUp() throws Exception {
+    super.setUp();
+    // every test runs with and without the run-end cache across seeds
+    CollectExperiments.setCacheRunEnd(random().nextBoolean());
+  }
+
+  @Override
+  public void tearDown() throws Exception {
+    CollectExperiments.setCacheRunEnd(false);
+    super.tearDown();
+  }
+
+  /**
+   * One clause matches nearly every doc (long runs broken by a few holes, like a time range that
+   * covers almost the whole segment), the other is random. The matches must not depend on the
+   * run-end cache, whichever way the range is split into score() calls.
+   */
+  public void testCachedRunEndMatches() throws IOException {
+    int maxDoc = TestUtil.nextInt(random(), 20_000, 200_000);
+    FixedBitSet wide = new FixedBitSet(maxDoc);
+    wide.set(0, maxDoc);
+    int holes = random().nextInt(5);
+    for (int i = 0; i < holes; i++) {
+      int start = random().nextInt(maxDoc);
+      wide.clear(start, Math.min(maxDoc, start + 1 + random().nextInt(10_000)));
+    }
+    wide.clear(maxDoc - 1 - random().nextInt(10));
+    FixedBitSet narrow = new FixedBitSet(maxDoc);
+    int density = TestUtil.nextInt(random(), 1, 4);
+    for (int i = 0; i < maxDoc; i++) {
+      if (random().nextInt(density) == 0) {
+        narrow.set(i);
+      }
+    }
+    FixedBitSet expected = narrow.clone();
+    expected.and(wide);
+    for (boolean cache : new boolean[] {false, true}) {
+      CollectExperiments.setCacheRunEnd(cache);
+      BulkScorer scorer =
+          new DenseConjunctionBulkScorer(
+              Arrays.asList(
+                  new BitSetIterator(wide, wide.cardinality()),
+                  new BitSetIterator(narrow, narrow.cardinality())),
+              Collections.emptyList(),
+              maxDoc,
+              0f);
+      scorer = AssertingBulkScorer.wrap(random(), scorer, maxDoc);
+      FixedBitSet result = new FixedBitSet(maxDoc);
+      scorer.score(
+          new LeafCollector() {
+            @Override
+            public void setScorer(Scorable scorer) {}
+
+            @Override
+            public void collect(int doc) {
+              result.set(doc);
+            }
+          },
+          null,
+          0,
+          DocIdSetIterator.NO_MORE_DOCS);
+      assertEquals("cache=" + cache, expected, result);
+    }
+  }
 
   public void testSameMatches() throws IOException {
     int maxDoc = 100_000;

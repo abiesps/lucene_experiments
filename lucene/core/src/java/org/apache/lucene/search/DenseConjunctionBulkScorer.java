@@ -31,25 +31,51 @@ import org.apache.lucene.util.MathUtil;
  */
 final class DenseConjunctionBulkScorer extends BulkScorer {
 
-  private record DisiWrapper(DocIdSetIterator approximation, TwoPhaseIterator twoPhase) {
-    DisiWrapper(DocIdSetIterator iterator) {
-      this(iterator, null);
+  private static final class DisiWrapper {
+    private final DocIdSetIterator approximation;
+    private final TwoPhaseIterator twoPhase;
+    // Last run end returned by docIDRunEnd(): every doc in [docID(), runEnd) matches as long as
+    // docID() < runEnd, because the run was computed at an earlier doc of the same run. This avoids
+    // recomputing it for every window, which costs O(run length) for a bit set whose run spans
+    // most of the segment (e.g. a range that matches nearly every doc).
+    private int runEnd = -1;
+    private final boolean cacheRunEnd;
+
+    DisiWrapper(DocIdSetIterator iterator, boolean cacheRunEnd) {
+      this(iterator, null, cacheRunEnd);
     }
 
-    DisiWrapper(TwoPhaseIterator twoPhase) {
-      this(twoPhase.approximation(), twoPhase);
+    DisiWrapper(TwoPhaseIterator twoPhase, boolean cacheRunEnd) {
+      this(twoPhase.approximation(), twoPhase, cacheRunEnd);
+    }
+
+    DisiWrapper(DocIdSetIterator approximation, TwoPhaseIterator twoPhase, boolean cacheRunEnd) {
+      this.approximation = approximation;
+      this.twoPhase = twoPhase;
+      this.cacheRunEnd = cacheRunEnd;
+    }
+
+    DocIdSetIterator approximation() {
+      return approximation;
+    }
+
+    TwoPhaseIterator twoPhase() {
+      return twoPhase;
     }
 
     int docID() {
-      return approximation().docID();
+      return approximation.docID();
     }
 
     int docIDRunEnd() throws IOException {
-      if (twoPhase() == null) {
-        return approximation().docIDRunEnd();
-      } else {
-        return twoPhase().docIDRunEnd();
+      if (cacheRunEnd && approximation.docID() < runEnd) {
+        return runEnd;
       }
+      int end = twoPhase == null ? approximation.docIDRunEnd() : twoPhase.docIDRunEnd();
+      if (cacheRunEnd) {
+        runEnd = end;
+      }
+      return end;
     }
 
     void intoBitSet(int upTo, FixedBitSet bitSet, int offset) throws IOException {
@@ -104,11 +130,12 @@ final class DenseConjunctionBulkScorer extends BulkScorer {
     }
     this.maxDoc = maxDoc;
     this.iterators = new ArrayList<>();
+    final boolean cacheRunEnd = CollectExperiments.isCacheRunEnd();
     for (DocIdSetIterator iterator : iterators) {
-      this.iterators.add(new DisiWrapper(iterator));
+      this.iterators.add(new DisiWrapper(iterator, cacheRunEnd));
     }
     for (TwoPhaseIterator twoPhase : twoPhases) {
-      this.iterators.add(new DisiWrapper(twoPhase));
+      this.iterators.add(new DisiWrapper(twoPhase, cacheRunEnd));
     }
     // Plain approximations before two-phase ones, so matches() only runs on docs that already
     // satisfy every approximation; within each group, cheapest approximation first (lead skipping).
@@ -126,7 +153,8 @@ final class DenseConjunctionBulkScorer extends BulkScorer {
     List<DisiWrapper> iterators = this.iterators;
     if (collector.competitiveIterator() != null) {
       iterators = new ArrayList<>(iterators);
-      iterators.add(new DisiWrapper(collector.competitiveIterator()));
+      // the competitive iterator can drop docs while collecting, so its run end is not cached
+      iterators.add(new DisiWrapper(collector.competitiveIterator(), null, false));
     }
 
     for (DisiWrapper w : iterators) {
