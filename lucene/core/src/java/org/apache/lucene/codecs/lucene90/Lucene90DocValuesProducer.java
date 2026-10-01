@@ -601,9 +601,8 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     }
   }
 
-  /** Scratch buffers of {@link #spanDecodeRaw}, one per doc values instance. */
+  /** Scratch buffer of {@link #spanDecodeRaw}, one per doc values instance. */
   private static final class SpanScratch {
-    long[] values = new long[0];
     byte[] bytes = new byte[0];
   }
 
@@ -630,16 +629,18 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     if (span > (long) size * PackedSpans.MAX_SPAN_PER_DOC) {
       return false;
     }
-    if (scratch.values.length < span) {
-      scratch.values = new long[span];
-    }
     scratch.bytes =
-        PackedSpans.decode(
-            slice, 0L, entry.bitsPerValue, first, span, scratch.values, scratch.bytes);
-    final long[] decoded = scratch.values;
-    for (int k = 0; k < size; k++) {
-      values[valuesOffset + k] = decoded[docs[docsOffset + k] - first];
-    }
+        PackedSpans.gather(
+            slice,
+            0L,
+            entry.bitsPerValue,
+            docs,
+            docsOffset,
+            size,
+            0,
+            values,
+            valuesOffset,
+            scratch.bytes);
     return true;
   }
 
@@ -1420,6 +1421,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           }
 
           private final SpanScratch scratch = new SpanScratch();
+          private long[] ordScratch = new long[0];
 
           @Override
           public void ordValues(int size, int[] docs, int[] ords) throws IOException {
@@ -1431,21 +1433,23 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             final int span = docs[size - 1] - first + 1;
             if (CollectExperiments.isBulkDecode()
                 && span <= (long) size * PackedSpans.MAX_SPAN_PER_DOC) {
-              if (scratch.values.length < span) {
-                scratch.values = new long[span];
+              if (ordScratch.length < size) {
+                ordScratch = new long[Math.max(size, 1024)];
               }
               scratch.bytes =
-                  PackedSpans.decode(
+                  PackedSpans.gather(
                       slice,
                       0L,
                       ordsEntry.bitsPerValue,
-                      first,
-                      span,
-                      scratch.values,
+                      docs,
+                      0,
+                      size,
+                      0,
+                      ordScratch,
+                      0,
                       scratch.bytes);
-              final long[] decoded = scratch.values;
               for (int i = 0; i < size; i++) {
-                ords[i] = (int) decoded[docs[i] - first];
+                ords[i] = (int) ordScratch[i];
               }
             } else {
               for (int i = 0; i < size; i++) {
@@ -2476,14 +2480,21 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         if (bitsPerValue == 0) {
           Arrays.fill(out, o, o + count, delta);
         } else if (span <= (long) count * PackedSpans.MAX_SPAN_PER_DOC) {
-          if (spanValues.length < span) {
-            spanValues = new long[1 << shift];
-          }
+          // docs of this block are block << shift + index
           spanBytes =
-              PackedSpans.decode(slice, offset, bitsPerValue, first, span, spanValues, spanBytes);
-          final long[] decoded = spanValues;
-          for (int k = 0; k < count; k++) {
-            out[o + k] = mul * decoded[(docs[i + k] & mask) - first] + delta;
+              PackedSpans.gather(
+                  slice,
+                  offset,
+                  bitsPerValue,
+                  docs,
+                  i,
+                  count,
+                  (int) (block << shift),
+                  out,
+                  o,
+                  spanBytes);
+          for (int k = o, e = o + count; k < e; k++) {
+            out[k] = mul * out[k] + delta;
           }
         } else {
           for (int k = 0; k < count; k++) {
@@ -2494,7 +2505,6 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       }
     }
 
-    private long[] spanValues = new long[0];
     private byte[] spanBytes = new byte[0];
     private int bitsPerValue;
 

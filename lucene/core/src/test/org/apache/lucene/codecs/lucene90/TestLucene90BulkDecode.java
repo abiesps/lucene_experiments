@@ -51,7 +51,7 @@ public class TestLucene90BulkDecode extends LuceneTestCase {
     super.tearDown();
   }
 
-  /** Every span of a DirectWriter array decodes to what DirectReader reads, for every width. */
+  /** Gathering any sorted set of indexes returns what DirectReader reads, for every width. */
   public void testPackedSpansMatchDirectReader() throws IOException {
     try (Directory dir = newDirectory()) {
       for (int bpv : BITS_PER_VALUE) {
@@ -77,13 +77,25 @@ public class TestLucene90BulkDecode extends LuceneTestCase {
           LongValues reader = DirectReader.getInstance(slice, bpv, prefix);
           byte[] buffer = new byte[0];
           for (int iter = 0; iter < 50; iter++) {
-            int first = random().nextInt(n);
-            int count = TestUtil.nextInt(random(), 1, n - first);
-            long[] decoded = new long[count];
-            buffer = PackedSpans.decode(slice, prefix, bpv, first, count, decoded, buffer);
+            // a sorted set of indexes, dense or sparse, shifted by a doc base
+            int docBase = random().nextInt(1000);
+            int step = TestUtil.nextInt(random(), 1, 80);
+            int[] docs = new int[n];
+            int count = 0;
+            for (int idx = random().nextInt(n);
+                idx < n;
+                idx += TestUtil.nextInt(random(), 1, step)) {
+              docs[count++] = docBase + idx;
+            }
+            int outOffset = random().nextInt(3);
+            long[] got = new long[count + outOffset];
+            buffer =
+                PackedSpans.gather(
+                    slice, prefix, bpv, docs, 0, count, docBase, got, outOffset, buffer);
             for (int i = 0; i < count; i++) {
-              assertEquals("bpv=" + bpv + " index=" + (first + i), original[first + i], decoded[i]);
-              assertEquals(reader.get(first + i), decoded[i]);
+              int idx = docs[i] - docBase;
+              assertEquals("bpv=" + bpv + " index=" + idx, original[idx], got[outOffset + i]);
+              assertEquals(reader.get(idx), got[outOffset + i]);
             }
           }
         }
