@@ -192,7 +192,10 @@ final class DocValuesNodes {
     return firstDocAtOrAfter((node + 1) * nodeBytes);
   }
 
-  /** Requests, in whole nodes, the bytes read for the values of docs {@code [fromDoc, toDoc)}. */
+  /**
+   * Requests, in whole nodes, the bytes read for the values of docs {@code [fromDoc, toDoc)}: the
+   * values and, for the blocked encoding, the header of the first doc's block.
+   */
   void prefetch(int fromDoc, int toDoc, long nodeBytes) throws IOException {
     if (toDoc <= fromDoc || nodeBytes <= 0 || valuesLength == 0) {
       return;
@@ -203,7 +206,9 @@ final class DocValuesNodes {
       requested.reset();
     }
     final long end = valuesOffset + valuesLength;
-    final long startByte = position(fromDoc);
+    // blocked encoding: reading a value also reads its block's header, which may sit in an earlier node
+    final long startByte =
+        jumpTable == null ? position(fromDoc) : blockStart(fromDoc >>> blockShift);
     final long endByte = Math.min(end, position(toDoc - 1) + READ_SPAN); // exclusive
     final long base = valuesOffset / nodeBytes;
     final long n0 = startByte / nodeBytes;
