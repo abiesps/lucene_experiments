@@ -20,7 +20,6 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -30,7 +29,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.ServiceLoader;
 import java.util.Set;
-import java.util.TreeMap;
 import org.apache.lucene.codecs.FieldsConsumer;
 import org.apache.lucene.codecs.FieldsProducer;
 import org.apache.lucene.codecs.NormsProducer;
@@ -43,6 +41,7 @@ import org.apache.lucene.index.MergeState;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.Terms;
+import org.apache.lucene.util.FrozenStringMap;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.MergedIterator;
 
@@ -269,7 +268,9 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
 
   private static class FieldsReader extends FieldsProducer {
 
-    private final Map<String, FieldsProducer> fields = new TreeMap<>();
+    // Field name -> producer. A hash table built once per segment: terms(field) runs for every
+    // segment of every query, and a tree lookup costs a chain of dependent loads per level.
+    private final FrozenStringMap<FieldsProducer> fields;
     private final Map<String, FieldsProducer> formats = new HashMap<>();
     private final String segment;
 
@@ -284,11 +285,13 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
       }
 
       // Then rebuild fields:
-      for (Map.Entry<String, FieldsProducer> ent : other.fields.entrySet()) {
-        FieldsProducer producer = oldToNew.get(ent.getValue());
+      Map<String, FieldsProducer> byName = HashMap.newHashMap(other.fields.size());
+      for (int i = 0; i < other.fields.size(); i++) {
+        FieldsProducer producer = oldToNew.get(other.fields.valueAt(i));
         assert producer != null;
-        fields.put(ent.getKey(), producer);
+        byName.put(other.fields.keyAt(i), producer);
       }
+      fields = FrozenStringMap.of(byName);
 
       segment = other.segment;
     }
@@ -296,6 +299,7 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
     public FieldsReader(final SegmentReadState readState) throws IOException {
 
       // Read _X.per and init each format:
+      Map<String, FieldsProducer> byName = new HashMap<>();
       boolean success = false;
       try {
         // Read field name -> format name
@@ -317,10 +321,11 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
                     segmentSuffix,
                     format.fieldsProducer(new SegmentReadState(readState, segmentSuffix)));
               }
-              fields.put(fieldName, formats.get(segmentSuffix));
+              byName.put(fieldName, formats.get(segmentSuffix));
             }
           }
         }
+        fields = FrozenStringMap.of(byName);
         success = true;
       } finally {
         if (!success) {
@@ -333,7 +338,7 @@ public abstract class PerFieldPostingsFormat extends PostingsFormat {
 
     @Override
     public Iterator<String> iterator() {
-      return Collections.unmodifiableSet(fields.keySet()).iterator();
+      return fields.sortedKeys().iterator();
     }
 
     @Override
