@@ -60,6 +60,16 @@ final class BitSetDocIdStream extends DocIdStream {
   }
 
   @Override
+  public void intoBitSet(int upTo, FixedBitSet dest, int destOffset) {
+    if (upTo > this.upTo) {
+      upTo = Math.min(upTo, max);
+      FixedBitSet.orRange(
+          bitSet, this.upTo - offset, dest, this.upTo - destOffset, upTo - this.upTo);
+      this.upTo = upTo;
+    }
+  }
+
+  @Override
   public int intoArray(int upTo, int[] array) {
     if (upTo > this.upTo) {
       upTo = Math.min(upTo, max);

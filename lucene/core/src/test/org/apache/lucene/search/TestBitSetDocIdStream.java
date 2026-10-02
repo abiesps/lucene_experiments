@@ -186,4 +186,29 @@ public class TestBitSetDocIdStream extends LuceneTestCase {
 
     assertFalse(stream.mayHaveRemaining());
   }
+
+  public void testIntoBitSetUpTo() throws IOException {
+    for (int iter = 0; iter < 100; iter++) {
+      FixedBitSet bitSet = randomBitSet();
+      int base = TestUtil.nextInt(random(), 0, 200);
+      int destOffset = base - TestUtil.nextInt(random(), 0, 70);
+      FixedBitSet dest = new FixedBitSet(base - destOffset + bitSet.length() + 10);
+      FixedBitSet expected = new FixedBitSet(dest.length());
+      BitSetDocIdStream stream = new BitSetDocIdStream(bitSet, base);
+      int upTo = base;
+      while (stream.mayHaveRemaining()) {
+        int next = upTo + TestUtil.nextInt(random(), 0, 30);
+        stream.intoBitSet(next, dest, destOffset);
+        for (int doc = upTo; doc < Math.min(next, base + bitSet.length()); doc++) {
+          if (bitSet.get(doc - base)) {
+            expected.set(doc - destOffset);
+          }
+        }
+        upTo = Math.max(upTo, next);
+        assertEquals(expected, dest);
+      }
+      // the stream is consumed
+      assertEquals(0, stream.count());
+    }
+  }
 }

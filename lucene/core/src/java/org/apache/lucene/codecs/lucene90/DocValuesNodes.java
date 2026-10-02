@@ -206,7 +206,8 @@ final class DocValuesNodes {
       requested.reset();
     }
     final long end = valuesOffset + valuesLength;
-    // blocked encoding: reading a value also reads its block's header, which may sit in an earlier node
+    // blocked encoding: reading a value also reads its block's header, which may sit in an earlier
+    // node
     final long startByte =
         jumpTable == null ? position(fromDoc) : blockStart(fromDoc >>> blockShift);
     final long endByte = Math.min(end, position(toDoc - 1) + READ_SPAN); // exclusive

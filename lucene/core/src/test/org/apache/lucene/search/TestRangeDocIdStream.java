@@ -18,6 +18,8 @@ package org.apache.lucene.search;
 
 import java.io.IOException;
 import org.apache.lucene.tests.util.LuceneTestCase;
+import org.apache.lucene.tests.util.TestUtil;
+import org.apache.lucene.util.FixedBitSet;
 
 public class TestRangeDocIdStream extends LuceneTestCase {
 
@@ -142,5 +144,65 @@ public class TestRangeDocIdStream extends LuceneTestCase {
     assertEquals(100 - 90, stream.count(120));
 
     assertFalse(stream.mayHaveRemaining());
+  }
+
+  public void testIntoBitSetUpTo() throws IOException {
+    for (int iter = 0; iter < 100; iter++) {
+      int min = TestUtil.nextInt(random(), 0, 100);
+      int max = min + TestUtil.nextInt(random(), 1, 200);
+      int offset = min - TestUtil.nextInt(random(), 0, 70);
+      FixedBitSet dest = new FixedBitSet(max - offset + 10);
+      FixedBitSet expected = new FixedBitSet(dest.length());
+      RangeDocIdStream stream = new RangeDocIdStream(min, max);
+      int upTo = min;
+      while (stream.mayHaveRemaining()) {
+        int next = upTo + TestUtil.nextInt(random(), 0, 40);
+        stream.intoBitSet(next, dest, offset);
+        for (int doc = upTo; doc < Math.min(next, max); doc++) {
+          expected.set(doc - offset);
+        }
+        upTo = Math.max(upTo, next);
+        assertEquals(expected, dest);
+      }
+    }
+  }
+
+  public void testDefaultIntoBitSet() throws IOException {
+    // the default implementation, through forEach
+    FixedBitSet source = new FixedBitSet(300);
+    for (int i = 0; i < 300; i += TestUtil.nextInt(random(), 1, 9)) {
+      source.set(i);
+    }
+    DocIdStream stream =
+        new DocIdStream() {
+          final DocIdStream in = new BitSetDocIdStream(source, 0);
+
+          @Override
+          public void forEach(int upTo, CheckedIntConsumer<IOException> consumer)
+              throws IOException {
+            in.forEach(upTo, consumer);
+          }
+
+          @Override
+          public int count(int upTo) throws IOException {
+            return in.count(upTo);
+          }
+
+          @Override
+          public int intoArray(int upTo, int[] array) {
+            return in.intoArray(upTo, array);
+          }
+
+          @Override
+          public boolean mayHaveRemaining() {
+            return in.mayHaveRemaining();
+          }
+        };
+    FixedBitSet dest = new FixedBitSet(400);
+    stream.intoBitSet(150, dest, -100);
+    stream.intoBitSet(DocIdSetIterator.NO_MORE_DOCS, dest, -100);
+    for (int i = 0; i < 400; i++) {
+      assertEquals(i >= 100 && source.get(i - 100), dest.get(i));
+    }
   }
 }

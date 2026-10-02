@@ -17,6 +17,7 @@
 package org.apache.lucene.search;
 
 import java.io.IOException;
+import org.apache.lucene.util.FixedBitSet;
 
 /**
  * A stream of doc IDs. Doc IDs may be consumed at most once.
@@ -79,4 +80,16 @@ public abstract class DocIdStream {
    * {@code false} when the stream is exhausted.
    */
   public abstract boolean mayHaveRemaining();
+
+  /**
+   * Sets, in {@code bitSet}, the bit at index {@code doc - offset} of every doc ID of this stream
+   * under {@code upTo} (exclusive), and consumes these doc IDs. The default implementation calls
+   * {@link #forEach(int, CheckedIntConsumer)}; streams backed by a bit set or a range copy whole
+   * words.
+   *
+   * @lucene.experimental
+   */
+  public void intoBitSet(int upTo, FixedBitSet bitSet, int offset) throws IOException {
+    forEach(upTo, doc -> bitSet.set(doc - offset));
+  }
 }

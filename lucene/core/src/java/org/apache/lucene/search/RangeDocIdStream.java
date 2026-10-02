@@ -17,6 +17,7 @@
 package org.apache.lucene.search;
 
 import java.io.IOException;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.MathUtil;
 
 final class RangeDocIdStream extends DocIdStream {
@@ -57,6 +58,15 @@ final class RangeDocIdStream extends DocIdStream {
       return count;
     } else {
       return 0;
+    }
+  }
+
+  @Override
+  public void intoBitSet(int upTo, FixedBitSet bitSet, int offset) {
+    if (upTo > this.upTo) {
+      upTo = Math.min(upTo, max);
+      bitSet.set(this.upTo - offset, upTo - offset);
+      this.upTo = upTo;
     }
   }
 
