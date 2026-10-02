@@ -978,13 +978,16 @@ public final class FixedBitSet extends BitSet {
       assert (from & 0x3F) == 0;
     }
 
-    for (int i = from >> 6, end = to >> 6; i < end; ++i) {
+    // stop once the array is full: callers resume after the last copied doc ID, and scanning the
+    // rest of a long
+    // range would cost O(range) per call
+    for (int i = from >> 6, end = to >> 6; i < end && offset < array.length; ++i) {
       long word = bits[i];
       offset = word2Array(word, base + (i << 6), array, offset);
     }
 
     // Now handle remaining bits in the last partial word
-    if ((to & 0x3F) != 0) {
+    if ((to & 0x3F) != 0 && offset < array.length) {
       long word = bits[to >> 6] & ((1L << to) - 1);
       offset = word2Array(word, base + (to & ~0x3F), array, offset);
     }
