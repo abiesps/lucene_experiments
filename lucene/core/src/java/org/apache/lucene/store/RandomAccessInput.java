@@ -30,6 +30,17 @@ public interface RandomAccessInput {
   long length();
 
   /**
+   * Experimental: whether the bytes in {@code [offset, offset + length)} are loaded (for example in
+   * a page or block cache), so reading them needs no IO; empty when the input cannot tell (the
+   * default).
+   *
+   * @lucene.experimental
+   */
+  default Optional<Boolean> isLoaded(long offset, long length) throws IOException {
+    return Optional.empty();
+  }
+
+  /**
    * Reads a byte at the given position in the file
    *
    * @see DataInput#readByte

@@ -71,4 +71,9 @@ public abstract class FilterNumericDocValues extends NumericDocValues {
   public int nextPrefetchNodeDoc(int doc, long nodeBytes) throws IOException {
     return in.nextPrefetchNodeDoc(doc, nodeBytes);
   }
+
+  @Override
+  public boolean isNodeLoaded(int doc, long nodeBytes) throws IOException {
+    return in.isNodeLoaded(doc, nodeBytes);
+  }
 }

@@ -99,6 +99,11 @@ public abstract class FilterSortedDocValues extends SortedDocValues {
   }
 
   @Override
+  public boolean isNodeLoaded(int doc, long nodeBytes) throws IOException {
+    return in.isNodeLoaded(doc, nodeBytes);
+  }
+
+  @Override
   public void ordValues(int size, int[] docs, int[] ords) throws IOException {
     in.ordValues(size, docs, ords);
   }

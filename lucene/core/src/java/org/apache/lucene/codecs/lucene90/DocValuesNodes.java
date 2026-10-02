@@ -37,7 +37,7 @@ final class DocValuesNodes {
   /** Bytes a read of one value may touch past its first byte (8-byte loads of packed values). */
   private static final int READ_SPAN = Long.BYTES;
 
-  private static final int BLOCK_HEADER = 1 + Long.BYTES + Integer.BYTES; // bpv, delta, length
+  static final int BLOCK_HEADER = 1 + Long.BYTES + Integer.BYTES; // bpv, delta, length
   private static final int BLOCK_HEADER_ZERO_BPV = 1 + Long.BYTES; // bpv = 0, delta
 
   private final RandomAccessInput slice; // the values, starting at file offset valuesOffset
@@ -196,6 +196,24 @@ final class DocValuesNodes {
    * Requests, in whole nodes, the bytes read for the values of docs {@code [fromDoc, toDoc)}: the
    * values and, for the blocked encoding, the header of the first doc's block.
    */
+  /**
+   * Whether the nodes {@link #prefetch} would request for docs in {@code [fromDoc, toDoc)} are all
+   * loaded already (by the input's own knowledge; false when the input cannot tell). Reads nothing
+   * but navigation data.
+   */
+  boolean isLoaded(int fromDoc, int toDoc, long nodeBytes) throws IOException {
+    if (toDoc <= fromDoc || nodeBytes <= 0 || valuesLength == 0) {
+      return true;
+    }
+    final long end = valuesOffset + valuesLength;
+    final long startByte =
+        jumpTable == null ? position(fromDoc) : blockStart(fromDoc >>> blockShift);
+    final long endByte = Math.min(end, position(toDoc - 1) + READ_SPAN); // exclusive
+    final long s = Math.max((startByte / nodeBytes) * nodeBytes, valuesOffset) - valuesOffset;
+    final long e = Math.min(((endByte - 1) / nodeBytes + 1) * nodeBytes, end) - valuesOffset;
+    return e <= s || slice.isLoaded(s, e - s).orElse(false);
+  }
+
   void prefetch(int fromDoc, int toDoc, long nodeBytes) throws IOException {
     if (toDoc <= fromDoc || nodeBytes <= 0 || valuesLength == 0) {
       return;

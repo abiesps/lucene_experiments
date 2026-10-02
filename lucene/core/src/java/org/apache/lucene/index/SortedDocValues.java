@@ -85,6 +85,15 @@ public abstract class SortedDocValues extends DocValuesIterator {
   }
 
   /**
+   * Experimental: see {@link NumericDocValues#isNodeLoaded}, for the ordinals; false if unknown.
+   *
+   * @lucene.experimental
+   */
+  public boolean isNodeLoaded(int doc, long nodeBytes) throws IOException {
+    return false;
+  }
+
+  /**
    * Retrieves the value for the specified ordinal. The returned {@link BytesRef} may be re-used
    * across calls to {@link #lookupOrd(int)} so make sure to {@link BytesRef#deepCopyOf(BytesRef)
    * copy it} if you want to keep it around.

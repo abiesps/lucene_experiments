@@ -111,6 +111,17 @@ public abstract class NumericDocValues extends DocValuesIterator {
   }
 
   /**
+   * Experimental: whether the nodes {@link #prefetchNodes} would request for {@code doc} are all
+   * loaded already, so reading its value needs no IO. False when unknown (the default). Does not
+   * move the iterator.
+   *
+   * @lucene.experimental
+   */
+  public boolean isNodeLoaded(int doc, long nodeBytes) throws IOException {
+    return false;
+  }
+
+  /**
    * Offset-aware variant of {@link #longValues(int, int[], long[], long)}. Reads {@code size} doc
    * IDs starting at {@code docs[docsOffset]} and writes the corresponding values starting at {@code
    * values[valuesOffset]}. This follows the same convention as {@link System#arraycopy}.

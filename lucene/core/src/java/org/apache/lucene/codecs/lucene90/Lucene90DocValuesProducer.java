@@ -894,6 +894,12 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
             }
 
             @Override
+            public boolean isNodeLoaded(int doc, long nodeBytes) throws IOException {
+              final DocValuesNodes n = nodes();
+              return n != null && n.isLoaded(doc, doc + 1, nodeBytes);
+            }
+
+            @Override
             public int nextPrefetchNodeDoc(int doc, long nodeBytes) throws IOException {
               final DocValuesNodes n = nodes();
               return n == null ? -1 : n.nextNodeDoc(doc, nodeBytes);
@@ -952,6 +958,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
                   throws IOException {
                 nodes().prefetch(fromDoc, toDoc, nodeBytes);
                 return true;
+              }
+
+              @Override
+              public boolean isNodeLoaded(int doc, long nodeBytes) throws IOException {
+                return nodes().isLoaded(doc, doc + 1, nodeBytes);
               }
 
               @Override
@@ -1020,6 +1031,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
                   throws IOException {
                 nodes().prefetch(fromDoc, toDoc, nodeBytes);
                 return true;
+              }
+
+              @Override
+              public boolean isNodeLoaded(int doc, long nodeBytes) throws IOException {
+                return nodes().isLoaded(doc, doc + 1, nodeBytes);
               }
 
               @Override
@@ -1100,6 +1116,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
                   throws IOException {
                 nodes().prefetch(fromDoc, toDoc, nodeBytes);
                 return true;
+              }
+
+              @Override
+              public boolean isNodeLoaded(int doc, long nodeBytes) throws IOException {
+                return nodes().isLoaded(doc, doc + 1, nodeBytes);
               }
 
               @Override
@@ -1553,6 +1574,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           public boolean prefetchNodes(int fromDoc, int toDoc, long nodeBytes) throws IOException {
             nodes().prefetch(fromDoc, toDoc, nodeBytes);
             return true;
+          }
+
+          @Override
+          public boolean isNodeLoaded(int doc, long nodeBytes) throws IOException {
+            return nodes().isLoaded(doc, doc + 1, nodeBytes);
           }
 
           @Override
