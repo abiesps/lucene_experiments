@@ -157,10 +157,13 @@ public class TestRangeDocIdStream extends LuceneTestCase {
       int upTo = min;
       while (stream.mayHaveRemaining()) {
         int next = upTo + TestUtil.nextInt(random(), 0, 40);
-        stream.intoBitSet(next, dest, offset);
+        int got = stream.intoBitSet(next, dest, offset);
+        int last = -2;
         for (int doc = upTo; doc < Math.min(next, max); doc++) {
           expected.set(doc - offset);
+          last = doc;
         }
+        assertEquals(last + 1, got);
         upTo = Math.max(upTo, next);
         assertEquals(expected, dest);
       }
@@ -199,8 +202,10 @@ public class TestRangeDocIdStream extends LuceneTestCase {
           }
         };
     FixedBitSet dest = new FixedBitSet(400);
-    stream.intoBitSet(150, dest, -100);
-    stream.intoBitSet(DocIdSetIterator.NO_MORE_DOCS, dest, -100);
+    assertEquals(source.prevSetBit(149) + 1, stream.intoBitSet(150, dest, -100));
+    assertEquals(
+        source.prevSetBit(299) + 1, stream.intoBitSet(DocIdSetIterator.NO_MORE_DOCS, dest, -100));
+    assertEquals(-1, stream.intoBitSet(DocIdSetIterator.NO_MORE_DOCS, dest, -100));
     for (int i = 0; i < 400; i++) {
       assertEquals(i >= 100 && source.get(i - 100), dest.get(i));
     }

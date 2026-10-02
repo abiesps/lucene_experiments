@@ -198,12 +198,15 @@ public class TestBitSetDocIdStream extends LuceneTestCase {
       int upTo = base;
       while (stream.mayHaveRemaining()) {
         int next = upTo + TestUtil.nextInt(random(), 0, 30);
-        stream.intoBitSet(next, dest, destOffset);
+        int got = stream.intoBitSet(next, dest, destOffset);
+        int last = -2;
         for (int doc = upTo; doc < Math.min(next, base + bitSet.length()); doc++) {
           if (bitSet.get(doc - base)) {
             expected.set(doc - destOffset);
+            last = doc;
           }
         }
+        assertEquals(last + 1, got);
         upTo = Math.max(upTo, next);
         assertEquals(expected, dest);
       }

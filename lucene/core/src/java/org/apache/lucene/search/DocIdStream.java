@@ -87,9 +87,17 @@ public abstract class DocIdStream {
    * {@link #forEach(int, CheckedIntConsumer)}; streams backed by a bit set or a range copy whole
    * words.
    *
+   * @return one more than the last doc ID copied, or -1 if no doc ID was copied
    * @lucene.experimental
    */
-  public void intoBitSet(int upTo, FixedBitSet bitSet, int offset) throws IOException {
-    forEach(upTo, doc -> bitSet.set(doc - offset));
+  public int intoBitSet(int upTo, FixedBitSet bitSet, int offset) throws IOException {
+    final int[] last = {-2};
+    forEach(
+        upTo,
+        doc -> {
+          bitSet.set(doc - offset);
+          last[0] = doc;
+        });
+    return last[0] + 1;
   }
 }

@@ -60,13 +60,18 @@ final class BitSetDocIdStream extends DocIdStream {
   }
 
   @Override
-  public void intoBitSet(int upTo, FixedBitSet dest, int destOffset) {
+  public int intoBitSet(int upTo, FixedBitSet dest, int destOffset) {
     if (upTo > this.upTo) {
       upTo = Math.min(upTo, max);
-      FixedBitSet.orRange(
-          bitSet, this.upTo - offset, dest, this.upTo - destOffset, upTo - this.upTo);
+      final int from = this.upTo;
+      FixedBitSet.orRange(bitSet, from - offset, dest, from - destOffset, upTo - from);
       this.upTo = upTo;
+      final int last = bitSet.prevSetBit(upTo - offset - 1);
+      if (last != DocIdSetIterator.NO_MORE_DOCS && last >= from - offset) {
+        return offset + last + 1;
+      }
     }
+    return -1;
   }
 
   @Override

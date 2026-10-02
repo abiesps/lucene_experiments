@@ -62,12 +62,14 @@ final class RangeDocIdStream extends DocIdStream {
   }
 
   @Override
-  public void intoBitSet(int upTo, FixedBitSet bitSet, int offset) {
+  public int intoBitSet(int upTo, FixedBitSet bitSet, int offset) {
     if (upTo > this.upTo) {
       upTo = Math.min(upTo, max);
       bitSet.set(this.upTo - offset, upTo - offset);
       this.upTo = upTo;
+      return upTo;
     }
+    return -1;
   }
 
   @Override
