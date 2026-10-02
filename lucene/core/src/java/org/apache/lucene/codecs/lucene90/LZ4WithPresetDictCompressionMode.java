@@ -21,6 +21,7 @@ import org.apache.lucene.codecs.compressing.CompressionMode;
 import org.apache.lucene.codecs.compressing.Compressor;
 import org.apache.lucene.codecs.compressing.Decompressor;
 import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.store.ByteArrayDataInput;
 import org.apache.lucene.store.ByteBuffersDataInput;
 import org.apache.lucene.store.ByteBuffersDataOutput;
 import org.apache.lucene.store.DataInput;
@@ -63,16 +64,25 @@ public final class LZ4WithPresetDictCompressionMode extends CompressionMode {
   private static final class LZ4WithPresetDictDecompressor extends Decompressor {
 
     private int[] compressedLengths;
+    private int dictCompressedLength;
     private byte[] buffer;
+    // Compressed bytes of the dictionary or of one sub-block. They are copied from the input with
+    // one
+    // readBytes call and decoded from this array, instead of one IndexInput call per LZ4 token,
+    // match
+    // offset and literal run (about 1,700 calls for a 12 KB fetch).
+    private byte[] compressed;
+    private final ByteArrayDataInput compressedIn = new ByteArrayDataInput();
 
     LZ4WithPresetDictDecompressor() {
       compressedLengths = new int[0];
       buffer = new byte[0];
+      compressed = new byte[0];
     }
 
     private int readCompressedLengths(
         DataInput in, int originalLength, int dictLength, int blockLength) throws IOException {
-      in.readVInt(); // compressed length of the dictionary, unused
+      dictCompressedLength = in.readVInt();
       int totalLength = dictLength;
       int i = 0;
       compressedLengths = ArrayUtil.growNoCopy(compressedLengths, originalLength / blockLength + 1);
@@ -102,19 +112,20 @@ public final class LZ4WithPresetDictCompressionMode extends CompressionMode {
       buffer = ArrayUtil.growNoCopy(buffer, dictLength + blockLength);
       bytes.length = 0;
       // Read the dictionary
-      if (LZ4.decompress(in, dictLength, buffer, 0) != dictLength) {
+      if (decompressBulk(in, dictCompressedLength, dictLength, 0) != dictLength) {
         throw new CorruptIndexException("Illegal dict length", in);
       }
 
       int offsetInBlock = dictLength;
       int offsetInBytesRef = offset;
+      int block = 0;
       if (offset >= dictLength) {
         offsetInBytesRef -= dictLength;
 
         // Skip unneeded blocks
         int numBytesToSkip = 0;
-        for (int i = 0; i < numBlocks && offsetInBlock + blockLength < offset; ++i) {
-          int compressedBlockLength = compressedLengths[i];
+        for (; block < numBlocks && offsetInBlock + blockLength < offset; ++block) {
+          int compressedBlockLength = compressedLengths[block];
           numBytesToSkip += compressedBlockLength;
           offsetInBlock += blockLength;
           offsetInBytesRef -= blockLength;
@@ -133,7 +144,10 @@ public final class LZ4WithPresetDictCompressionMode extends CompressionMode {
       }
       while (offsetInBlock < offset + length) {
         final int bytesToDecompress = Math.min(blockLength, offset + length - offsetInBlock);
-        LZ4.decompress(in, bytesToDecompress, buffer, dictLength);
+        if (block >= numBlocks) {
+          throw new CorruptIndexException("Missing sub-block " + block + " of " + numBlocks, in);
+        }
+        decompressBulk(in, compressedLengths[block++], bytesToDecompress, dictLength);
         System.arraycopy(buffer, dictLength, bytes.bytes, bytes.length, bytesToDecompress);
         bytes.length += bytesToDecompress;
         offsetInBlock += blockLength;
@@ -142,6 +156,32 @@ public final class LZ4WithPresetDictCompressionMode extends CompressionMode {
       bytes.offset = offsetInBytesRef;
       bytes.length = length;
       assert bytes.isValid();
+    }
+
+    /**
+     * Copies {@code compressedLength} bytes from {@code in} with one call, then LZ4-decompresses at
+     * least {@code decompressedLength} bytes from them into {@code buffer[dOff:]}. Leaves {@code
+     * in} positioned after the compressed bytes, like decompressing from {@code in} directly.
+     */
+    private int decompressBulk(DataInput in, int compressedLength, int decompressedLength, int dOff)
+        throws IOException {
+      if (compressedLength < 0) {
+        throw new CorruptIndexException("Illegal compressed length: " + compressedLength, in);
+      }
+      compressed = ArrayUtil.growNoCopy(compressed, compressedLength);
+      in.readBytes(compressed, 0, compressedLength);
+      compressedIn.reset(compressed, 0, compressedLength);
+      final int end;
+      try {
+        end = LZ4.decompress(compressedIn, decompressedLength, buffer, dOff);
+      } catch (IndexOutOfBoundsException e) {
+        throw new CorruptIndexException(
+            "Corrupt LZ4 block of " + compressedLength + " bytes", in, e);
+      }
+      if (compressedIn.getPosition() > compressedLength) {
+        throw new CorruptIndexException("LZ4 block read past its compressed length", in);
+      }
+      return end - dOff;
     }
 
     @Override
