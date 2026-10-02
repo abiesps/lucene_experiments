@@ -35,6 +35,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 import org.apache.lucene.internal.hppc.IntObjectHashMap;
+import org.apache.lucene.util.FrozenStringMap;
 
 /**
  * Collection of {@link FieldInfo}s (accessible by number or by name).
@@ -62,7 +63,9 @@ public class FieldInfos implements Iterable<FieldInfo> {
 
   // used only by fieldInfo(int)
   private final FieldInfo[] byNumber;
-  private final HashMap<String, FieldInfo> byName;
+  // Field name -> FieldInfo. A hash table built once: fieldInfo(String) runs per segment for every
+  // terms, doc values, norms and points lookup of every query.
+  private final FrozenStringMap<FieldInfo> byName;
 
   /** Iterator in ascending order of field number. */
   private final Collection<FieldInfo> values;
@@ -85,7 +88,7 @@ public class FieldInfos implements Iterable<FieldInfo> {
     String softDeletesField = null;
     String parentField = null;
 
-    byName = HashMap.newHashMap(infos.length);
+    final HashMap<String, FieldInfo> byNameBuilder = HashMap.newHashMap(infos.length);
     int maxFieldNumber = -1;
     boolean fieldNumberStrictlyAscending = true;
     for (FieldInfo info : infos) {
@@ -99,7 +102,7 @@ public class FieldInfos implements Iterable<FieldInfo> {
       } else {
         fieldNumberStrictlyAscending = false;
       }
-      FieldInfo previous = byName.put(info.name, info);
+      FieldInfo previous = byNameBuilder.put(info.name, info);
       if (previous != null) {
         throw new IllegalArgumentException(
             "duplicate field names: "
@@ -137,6 +140,7 @@ public class FieldInfos implements Iterable<FieldInfo> {
       }
     }
 
+    byName = FrozenStringMap.of(byNameBuilder);
     this.hasTermVectors = hasTermVectors;
     this.hasPostings = hasPostings;
     this.hasProx = hasProx;
@@ -328,7 +332,7 @@ public class FieldInfos implements Iterable<FieldInfo> {
    * @return the FieldInfo object or null when the given fieldName doesn't exist.
    */
   public FieldInfo fieldInfo(String fieldName) {
-    return byName.get(fieldName);
+    return fieldName == null ? null : byName.get(fieldName);
   }
 
   /**
