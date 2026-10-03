@@ -17,6 +17,9 @@
 package org.apache.lucene.codecs.lucene90;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.PointsReader;
 import org.apache.lucene.index.CorruptIndexException;
@@ -119,11 +122,31 @@ public class Lucene90PointsReader extends PointsReader {
       // know that indexLength and dataLength are very likely correct.
       CodecUtil.retrieveChecksum(indexIn, indexLength);
       CodecUtil.retrieveChecksum(dataIn, dataLength);
+      setLeafDataEnds();
       success = true;
     } finally {
       if (success == false) {
         IOUtils.closeWhileHandlingException(this);
       }
+    }
+  }
+
+  /**
+   * Tells each field where its leaf blocks end in the data file: at the first leaf block of the
+   * field that follows it, or at the footer for the last field. Uses metadata only, no IO.
+   */
+  private void setLeafDataEnds() {
+    List<BKDReader> bkdReaders = new ArrayList<>(readers.size());
+    for (IntObjectHashMap.IntObjectCursor<PointValues> cursor : readers) {
+      bkdReaders.add((BKDReader) cursor.value);
+    }
+    bkdReaders.sort(Comparator.comparingLong(BKDReader::getMinLeafBlockFP));
+    for (int i = 0; i < bkdReaders.size(); i++) {
+      long end =
+          i + 1 < bkdReaders.size()
+              ? bkdReaders.get(i + 1).getMinLeafBlockFP()
+              : dataIn.length() - CodecUtil.footerLength();
+      bkdReaders.get(i).setLeafDataEnd(end);
     }
   }
 

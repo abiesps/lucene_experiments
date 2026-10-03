@@ -17,14 +17,20 @@
 package org.apache.lucene.codecs.lucene90;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.List;
 import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.FilterCodec;
 import org.apache.lucene.codecs.PointsFormat;
 import org.apache.lucene.codecs.PointsReader;
 import org.apache.lucene.codecs.PointsWriter;
 import org.apache.lucene.document.BinaryPoint;
 import org.apache.lucene.document.Document;
+import org.apache.lucene.document.IntPoint;
+import org.apache.lucene.document.LongPoint;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
@@ -34,12 +40,14 @@ import org.apache.lucene.index.PointValues;
 import org.apache.lucene.index.PointValues.IntersectVisitor;
 import org.apache.lucene.index.PointValues.Relation;
 import org.apache.lucene.index.SegmentReadState;
+import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.index.BasePointsFormatTestCase;
 import org.apache.lucene.tests.index.MockRandomMergePolicy;
 import org.apache.lucene.tests.util.TestUtil;
 import org.apache.lucene.util.bkd.BKDConfig;
+import org.apache.lucene.util.bkd.BKDReader;
 
 public class TestLucene90PointsFormat extends BasePointsFormatTestCase {
 
@@ -351,6 +359,58 @@ public class TestLucene90PointsFormat extends BasePointsFormatTestCase {
                           (numDocs - pointCount) / points.size(), points.size() / docCount))));
     } else {
       assertEquals(Math.min(pointCount, numDocs), docCount);
+    }
+    r.close();
+    dir.close();
+  }
+
+  /**
+   * Each field's leaf data ends where the next field's leaf data starts, the last at the footer.
+   */
+  public void testLeafDataEnds() throws IOException {
+    Directory dir = newDirectory();
+    IndexWriterConfig iwc = newIndexWriterConfig();
+    iwc.setCodec(codec);
+    iwc.setUseCompoundFile(false);
+    iwc.setMergePolicy(newLogMergePolicy(false));
+    IndexWriter w = new IndexWriter(dir, iwc);
+    int numFields = TestUtil.nextInt(random(), 1, 5);
+    int numDocs = atLeast(1000);
+    for (int i = 0; i < numDocs; i++) {
+      Document doc = new Document();
+      for (int f = 0; f < numFields; f++) {
+        if (random().nextInt(4) != 0) {
+          if (f % 2 == 0) {
+            doc.add(new LongPoint("f" + f, random().nextLong()));
+          } else {
+            doc.add(new IntPoint("f" + f, random().nextInt(), random().nextInt()));
+          }
+        }
+      }
+      w.addDocument(doc);
+    }
+    w.forceMerge(1);
+    IndexReader r = DirectoryReader.open(w);
+    w.close();
+    LeafReader lr = getOnlyLeafReader(r);
+    List<BKDReader> bkdReaders = new ArrayList<>();
+    for (int f = 0; f < numFields; f++) {
+      PointValues values = lr.getPointValues("f" + f);
+      if (values != null) {
+        assertTrue(values.getClass().getName(), values instanceof BKDReader);
+        bkdReaders.add((BKDReader) values);
+      }
+    }
+    bkdReaders.sort(Comparator.comparingLong(BKDReader::getMinLeafBlockFP));
+    String segmentName = ((SegmentReader) lr).getSegmentName();
+    long dataLength = dir.fileLength(segmentName + "." + Lucene90PointsFormat.DATA_EXTENSION);
+    for (int i = 0; i < bkdReaders.size(); i++) {
+      long expected =
+          i + 1 < bkdReaders.size()
+              ? bkdReaders.get(i + 1).getMinLeafBlockFP()
+              : dataLength - CodecUtil.footerLength();
+      assertEquals(expected, bkdReaders.get(i).getLeafDataEnd());
+      assertTrue(bkdReaders.get(i).getLeafDataEnd() > bkdReaders.get(i).getMinLeafBlockFP());
     }
     r.close();
     dir.close();

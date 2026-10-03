@@ -50,6 +50,8 @@ public class BKDReader extends PointValues {
   private final IndexInput indexIn;
   // if true, the tree is a legacy balanced tree
   private final boolean isTreeBalanced;
+  // end (exclusive) of this field's leaf blocks in the data file, -1 if unknown
+  long leafDataEnd = -1;
 
   /**
    * Caller must pre-seek the provided {@link IndexInput} to the index location that {@link
@@ -179,6 +181,39 @@ public class BKDReader extends PointValues {
           }
         });
     return count[0] != lastLeafNodePointCount;
+  }
+
+  /**
+   * Returns the file pointer of this field's first leaf block in the data file.
+   *
+   * @lucene.experimental
+   */
+  public long getMinLeafBlockFP() {
+    return minLeafBlockFP;
+  }
+
+  /**
+   * Sets the end (exclusive) of this field's leaf blocks in the data file: the first leaf block of
+   * the next field, or the end of the data before the footer. Reads nothing.
+   *
+   * @lucene.experimental
+   */
+  public void setLeafDataEnd(long fp) {
+    if (fp < minLeafBlockFP) {
+      throw new IllegalArgumentException(
+          "leaf data end " + fp + " is before the first leaf block " + minLeafBlockFP);
+    }
+    leafDataEnd = fp;
+  }
+
+  /**
+   * Returns the end (exclusive) of this field's leaf blocks in the data file, or -1 if it was not
+   * set.
+   *
+   * @lucene.experimental
+   */
+  public long getLeafDataEnd() {
+    return leafDataEnd;
   }
 
   @Override
