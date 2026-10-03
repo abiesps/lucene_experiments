@@ -79,7 +79,8 @@ module org.apache.lucene.core {
   provides org.apache.lucene.analysis.TokenizerFactory with
       org.apache.lucene.analysis.standard.StandardTokenizerFactory;
   provides org.apache.lucene.codecs.Codec with
-      org.apache.lucene.codecs.lucene104.Lucene104Codec;
+      org.apache.lucene.codecs.lucene104.Lucene104Codec,
+      org.apache.lucene.codecs.lucene104.Lucene104SplitPointsCodec;
   provides org.apache.lucene.codecs.DocValuesFormat with
       org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat;
   provides org.apache.lucene.codecs.KnnVectorsFormat with

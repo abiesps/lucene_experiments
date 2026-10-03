@@ -14,3 +14,4 @@
 #  limitations under the License.
 
 org.apache.lucene.codecs.lucene104.Lucene104Codec
+org.apache.lucene.codecs.lucene104.Lucene104SplitPointsCodec

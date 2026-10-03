@@ -24,6 +24,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import org.apache.lucene.codecs.FieldsProducer;
+import org.apache.lucene.codecs.PointsReader;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FieldInfo;
 import org.apache.lucene.index.FieldInfos;
@@ -41,6 +42,19 @@ final class PerFieldMergeState {
    * @return The new MergeState with restricted fields
    */
   static MergeState restrictFields(MergeState in, Collection<String> fields) {
+    return restrictFields(in, fields, in.pointsReaders);
+  }
+
+  /**
+   * Like {@link #restrictFields(MergeState, Collection)}, with {@code pointsReaders} in place of
+   * the points readers of {@code in}.
+   *
+   * @param fields The fields to keep in the new instance.
+   * @param pointsReaders The points reader of each segment, may hold nulls.
+   * @return The new MergeState with restricted fields
+   */
+  static MergeState restrictFields(
+      MergeState in, Collection<String> fields, PointsReader[] pointsReaders) {
     var fieldInfos = new FieldInfos[in.fieldInfos.length];
     for (int i = 0; i < in.fieldInfos.length; i++) {
       fieldInfos[i] = new FilterFieldInfos(in.fieldInfos[i], fields);
@@ -64,7 +78,7 @@ final class PerFieldMergeState {
         fieldInfos,
         in.liveDocs,
         fieldsProducers,
-        in.pointsReaders,
+        pointsReaders,
         in.knnVectorsReaders,
         in.maxDocs,
         in.infoStream,
