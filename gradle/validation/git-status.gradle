@@ -51,8 +51,22 @@ configure(rootProject) {
         project.ext.gitRevShort = ref.abbreviate(8).name()
         project.ext.gitStatus = new Git(repository).status().call()
       } catch (RepositoryNotFoundException | NoWorkTreeException e) {
-        project.ext.gitRev = "(not a git checkout)"
-        project.ext.gitRevShort = "(not a git checkout)"
+        // jgit cannot open a linked git worktree (.git is a file there); ask the git command for its HEAD instead,
+        // so jar manifests still name the commit they were built from. The dirty-files check stays skipped.
+        def worktreeRev = null
+        if (file("${rootProject.projectDir}/.git").isFile()) {
+          try {
+            def proc = ["git", "-C", rootProject.projectDir.absolutePath, "rev-parse", "HEAD"].execute()
+            def out = proc.text.trim()
+            if (proc.waitFor() == 0 && out ==~ /[0-9a-f]{40}/) {
+              worktreeRev = out
+            }
+          } catch (IOException ignored) {
+            // no git command: same as not a git checkout
+          }
+        }
+        project.ext.gitRev = worktreeRev ?: "(not a git checkout)"
+        project.ext.gitRevShort = worktreeRev ? worktreeRev.substring(0, 8) : "(not a git checkout)"
         project.ext.gitStatus = null
       } catch (NotSupportedException e) {
         throw new GradleException("jgit does not support git repository version at this location: ${dir}", e)
