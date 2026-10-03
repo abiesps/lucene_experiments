@@ -25,8 +25,22 @@ package org.apache.lucene.search;
 public final class CollectExperiments {
   private static volatile boolean cacheRunEnd;
   private static volatile boolean bulkDecode;
+  private static volatile boolean competitiveRunCap;
 
   private CollectExperiments() {}
+
+  /**
+   * Sets whether the competitive iterator of a numeric sort caps the doc ranges it adds per update,
+   * so that a run of competitive docs does not pull in value blocks beyond the next bound update.
+   */
+  public static void setCompetitiveRunCap(boolean on) {
+    competitiveRunCap = on;
+  }
+
+  /** Returns whether competitive doc ranges are capped. */
+  public static boolean isCompetitiveRunCap() {
+    return competitiveRunCap;
+  }
 
   /**
    * Sets whether bulk doc-values reads ({@link
