@@ -40,6 +40,7 @@ import org.apache.lucene.search.CollectExperiments;
 import org.apache.lucene.search.Collector;
 import org.apache.lucene.search.CollectorManager;
 import org.apache.lucene.search.ConstantScoreQuery;
+import org.apache.lucene.search.DocIdSet;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.DocIdStream;
 import org.apache.lucene.search.FieldDoc;
@@ -365,8 +366,214 @@ public class TestComparatorExperiments extends LuceneTestCase {
     final List<SwitchSetter> variants = new ArrayList<>();
     variants.add(random -> {}); // stock comparator (with the run cap, as every variant here)
     variants.add(random -> ComparatorExperiments.setSampleDocs(65536));
+    variants.add(
+        random -> ComparatorExperiments.setSkipperMode(ComparatorExperiments.SkipperMode.FIRST));
+    variants.add(
+        random -> ComparatorExperiments.setSkipperMode(ComparatorExperiments.SkipperMode.FALLBACK));
     return variants;
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // K4: skipper pruning with a live bound
+
+  public void testSkipperFirstSameResults() throws Exception {
+    assertSameResultsOnRandomIndices(
+        random -> {
+          ComparatorExperiments.setSkipperMode(ComparatorExperiments.SkipperMode.FIRST);
+          CollectExperiments.setCompetitiveRunCap(random.nextBoolean());
+          ComparatorExperiments.setSampleDocs(random.nextBoolean() ? 0 : 1 << 16);
+        },
+        false,
+        atLeast(3));
+  }
+
+  public void testSkipperFallbackSameResults() throws Exception {
+    // the randomized header: K2 on or off at random, so only results are compared
+    assertSameResultsOnRandomIndices(
+        random -> {
+          ComparatorExperiments.setSkipperMode(ComparatorExperiments.SkipperMode.FALLBACK);
+          CollectExperiments.setCompetitiveRunCap(random.nextBoolean());
+          ComparatorExperiments.setSampleDocs(random.nextBoolean() ? 0 : 1 << 16);
+        },
+        false,
+        atLeast(3));
+  }
+
+  public void testSkipperSameResultsMultiValued() throws Exception {
+    assertSameResultsOnRandomIndices(
+        random -> {
+          ComparatorExperiments.setSkipperMode(
+              random.nextBoolean()
+                  ? ComparatorExperiments.SkipperMode.FIRST
+                  : ComparatorExperiments.SkipperMode.FALLBACK);
+          CollectExperiments.setCompetitiveRunCap(random.nextBoolean());
+        },
+        true,
+        atLeast(2));
+  }
+
+  /**
+   * Two-run asc burst with the run cap: the live bound sees the decisive 500th replacement of the
+   * run-B entry, so run B is delivered for at most one skipper block and one scorer window past the
+   * burst. Stock sampling skips the decisive update and delivers all of run B.
+   */
+  public void testSkipperPrunesTwoRunBurst() throws Exception {
+    final int runDocs = 20 * 4096;
+    try (Directory dir = twoRunIndex(runDocs, runDocs);
+        DirectoryReader reader = DirectoryReader.open(dir)) {
+      final Sort sort = new Sort(new SortField(FIELD, SortField.Type.LONG));
+      final TopFieldDocs plain = search(reader, MatchAllDocsQuery.INSTANCE, sort, 500, null, 1000);
+      for (ComparatorExperiments.SkipperMode mode : ComparatorExperiments.SkipperMode.values()) {
+        ComparatorExperiments.setSkipperMode(mode);
+        CollectExperiments.setCompetitiveRunCap(true);
+        final Delivered delivered = new Delivered(reader.maxDoc());
+        final TopFieldDocs actual =
+            search(reader, MatchAllDocsQuery.INSTANCE, sort, 500, null, 1000, delivered);
+        resetSwitches();
+        assertSameTopDocs(plain, actual, 1000);
+        final long fromB = delivered.countIn(runDocs, 2 * runDocs);
+        if (mode == ComparatorExperiments.SkipperMode.OFF) {
+          assertEquals(runDocs, fromB);
+        } else {
+          assertTrue(mode + " delivered from run B " + fromB, fromB <= 500 + 2 * 4096);
+        }
+      }
+      // without the run cap only the results are checked: the old-bound YES run can cover run B
+      for (ComparatorExperiments.SkipperMode mode :
+          new ComparatorExperiments.SkipperMode[] {
+            ComparatorExperiments.SkipperMode.FIRST, ComparatorExperiments.SkipperMode.FALLBACK
+          }) {
+        ComparatorExperiments.setSkipperMode(mode);
+        final TopFieldDocs actual =
+            search(reader, MatchAllDocsQuery.INSTANCE, sort, 500, null, 1000);
+        resetSwitches();
+        assertSameTopDocs(plain, actual, 1000);
+      }
+    }
+  }
+
+  /**
+   * Desc corpus where points become selective once (near the end of a long rising run 1, with a
+   * short run 2 of higher values) and every later check is not selective against the smaller
+   * iterator cost: FALLBACK keeps the points iterator after the intersect, as stock does.
+   */
+  public void testSkipperFallbackKeepsPointsAfterIntersect() throws Exception {
+    final FixedBitSet[] hasValue = new FixedBitSet[1];
+    try (Directory dir = descCorpus(0, hasValue);
+        DirectoryReader reader = DirectoryReader.open(dir)) {
+      final Run stock = descRun(reader, ComparatorExperiments.SkipperMode.OFF, 0);
+      final Run fallback = descRun(reader, ComparatorExperiments.SkipperMode.FALLBACK, 0);
+      assertSameTopDocs(stock.top, fallback.top, 10);
+      final Recorder rec = fallback.recorder;
+      assertEquals(1, rec.intersects.size());
+      final int intersectCounter = rec.intersects.get(0);
+      // a later sampled check, more than 256 + 32 updates after the intersect, is not selective
+      final long laterEstimates =
+          rec.estimates.stream().filter(c -> c > intersectCounter + 256 + 32).count();
+      assertTrue("estimates after the intersect: " + rec.estimates, laterEstimates >= 1);
+      // before the intersect FALLBACK pruned with the live iterator ...
+      assertTrue(
+          rec.installs.subList(0, rec.intersectInstall.get(0)).stream()
+              .anyMatch(it -> it instanceof LiveSkipBlockRangeIterator));
+      // ... and after it the points iterator stays installed
+      assertEquals(rec.installs.size() - 1, (int) rec.intersectInstall.get(0));
+      assertFalse(rec.installs.get(rec.installs.size() - 1) instanceof LiveSkipBlockRangeIterator);
+      assertTrue(fallback.delivered.count <= stock.delivered.count);
+    }
+  }
+
+  /**
+   * With K2 off, FALLBACK estimates at the same updates as stock, intersects at the same update and
+   * builds the same points set; it delivers at most the docs with a value that stock delivers. With
+   * and without missing values.
+   */
+  public void testSkipperFallbackIntersectsWhereStockDoes() throws Exception {
+    for (double missing : new double[] {0, 0.1}) {
+      final FixedBitSet[] hasValue = new FixedBitSet[1];
+      try (Directory dir = descCorpus(missing, hasValue);
+          DirectoryReader reader = DirectoryReader.open(dir)) {
+        final Run stock = descRun(reader, ComparatorExperiments.SkipperMode.OFF, 0);
+        final Run fallback = descRun(reader, ComparatorExperiments.SkipperMode.FALLBACK, 0);
+        assertSameTopDocs(stock.top, fallback.top, 10);
+        assertFalse(stock.recorder.intersects.isEmpty());
+        assertTrue(stock.recorder.intersects.get(0) > 256 + 4 * 32);
+        assertEquals(stock.recorder.estimates, fallback.recorder.estimates);
+        assertEquals(stock.recorder.intersects, fallback.recorder.intersects);
+        assertEquals(stock.recorder.intersectedDocs, fallback.recorder.intersectedDocs);
+        assertTrue(
+            fallback.recorder.installs.stream()
+                .anyMatch(it -> it instanceof LiveSkipBlockRangeIterator));
+        if (missing == 0) {
+          assertTrue(fallback.delivered.count <= stock.delivered.count);
+        } else {
+          final FixedBitSet stockWithValue = stock.delivered.docs.clone();
+          stockWithValue.and(hasValue[0]);
+          final FixedBitSet fallbackWithValue = fallback.delivered.docs.clone();
+          fallbackWithValue.and(hasValue[0]);
+          assertTrue(fallbackWithValue.cardinality() <= stockWithValue.cardinality());
+        }
+        // with K2 on in both runs only the results are compared
+        final Run stockK2 = descRun(reader, ComparatorExperiments.SkipperMode.OFF, 4096);
+        final Run fallbackK2 = descRun(reader, ComparatorExperiments.SkipperMode.FALLBACK, 4096);
+        assertSameTopDocs(stock.top, stockK2.top, 10);
+        assertSameTopDocs(stockK2.top, fallbackK2.top, 10);
+      }
+    }
+  }
+
+  static final class Run {
+    TopFieldDocs top;
+    Delivered delivered;
+    Recorder recorder;
+  }
+
+  private Run descRun(IndexReader reader, ComparatorExperiments.SkipperMode mode, int sampleDocs)
+      throws IOException {
+    final Run run = new Run();
+    ComparatorExperiments.setSkipperMode(mode);
+    ComparatorExperiments.setSampleDocs(sampleDocs);
+    run.recorder = new Recorder();
+    NumericComparator.testHooks = run.recorder;
+    run.delivered = new Delivered(reader.maxDoc());
+    run.top =
+        search(
+            reader,
+            MatchAllDocsQuery.INSTANCE,
+            new Sort(new SortField(FIELD, SortField.Type.LONG, true)),
+            10,
+            null,
+            10,
+            run.delivered);
+    NumericComparator.testHooks = null;
+    resetSwitches();
+    return run;
+  }
+
+  /**
+   * Desc corpus: run 1 (300,000 docs, values rising from 1,000) then run 2 (18,000 docs, values
+   * above run 1), points and a skipper; a fraction {@code missing} of the docs has no value ({@code
+   * hasValue[0]} gets the docs that have one).
+   */
+  private static Directory descCorpus(double missing, FixedBitSet[] hasValue) throws IOException {
+    final int run1 = 300_000, run2 = 18_000;
+    final Random r = new Random(random().nextLong());
+    final Directory dir = newDirectory();
+    hasValue[0] = new FixedBitSet(run1 + run2);
+    try (IndexWriter w = new IndexWriter(dir, oneSegmentConfig())) {
+      for (int i = 0; i < run1 + run2; i++) {
+        if (r.nextDouble() < missing) {
+          w.addDocument(new Document());
+        } else {
+          hasValue[0].set(i);
+          w.addDocument(valueDoc(i < run1 ? 1_000L + i : 10_000_000L + i, true, true));
+        }
+      }
+    }
+    return dir;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // K2 helpers
 
   /** Records the hooks of every builder. */
   static final class Recorder implements NumericComparator.TestHooks {
@@ -375,7 +582,9 @@ public class TestComparatorExperiments extends LuceneTestCase {
     final List<int[]> runEnds = new ArrayList<>(); // {doc, result, lastAttemptDoc, sampleDocs}
     final List<Integer> estimates = new ArrayList<>(); // updateCounter
     final List<Integer> intersects = new ArrayList<>(); // updateCounter
-    final List<DocIdSetIterator> intersected = new ArrayList<>();
+    final List<List<Integer>> intersectedDocs = new ArrayList<>(); // the docs of every intersect
+    final List<Integer> intersectInstall = new ArrayList<>(); // index in installs of each intersect
+    final List<DocIdSetIterator> installs = new ArrayList<>();
     final List<int[]> events = new ArrayList<>(); // {kind, doc or -1, updateCounter, trailing}
     boolean trailingEnabled = true;
 
@@ -402,10 +611,27 @@ public class TestComparatorExperiments extends LuceneTestCase {
     }
 
     @Override
-    public void onIntersect(int updateCounter, DocIdSetIterator iterator) {
+    public void onIntersect(int updateCounter, DocIdSet points) {
       intersects.add(updateCounter);
-      intersected.add(iterator);
+      final List<Integer> docs = new ArrayList<>();
+      try {
+        final DocIdSetIterator it = points.iterator();
+        if (it != null) {
+          for (int d = it.nextDoc(); d != DocIdSetIterator.NO_MORE_DOCS; d = it.nextDoc()) {
+            docs.add(d);
+          }
+        }
+      } catch (IOException e) {
+        throw new AssertionError(e);
+      }
+      intersectedDocs.add(docs);
+      intersectInstall.add(installs.size() - 1);
       events.add(new int[] {INTERSECT, -1, updateCounter, 0});
+    }
+
+    @Override
+    public void onInstall(DocIdSetIterator iterator) {
+      installs.add(iterator);
     }
   }
 

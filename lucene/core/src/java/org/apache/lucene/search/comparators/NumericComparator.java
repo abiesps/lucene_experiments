@@ -25,6 +25,7 @@ import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.NumericDocValues;
 import org.apache.lucene.index.PointValues;
+import org.apache.lucene.search.DocIdSet;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.FieldComparator;
 import org.apache.lucene.search.LeafFieldComparator;
@@ -116,6 +117,13 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
       final int sampleDocs = ComparatorExperiments.getSampleDocs();
       final SkipperMode skipperMode = ComparatorExperiments.getSkipperMode();
       LeafReader reader = context.reader();
+      if (skipperMode == SkipperMode.FIRST) {
+        // K4 FIRST: prune with the doc-values skipper and the live bound, never with points
+        DocValuesSkipper skipper = reader.getDocValuesSkipper(field);
+        if (skipper != null) {
+          return new DVSkipperCompetitiveDISIBuilder(skipper, this, sampleDocs, skipperMode);
+        }
+      }
       PointValues pointValues = reader.getPointValues(field);
       if (pointValues != null) {
         return new PointsCompetitiveDISIBuilder(pointValues, this, sampleDocs, skipperMode);
@@ -238,6 +246,12 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     /** Test hooks, read once at leaf start. */
     final TestHooks hooks = testHooks;
 
+    /** K4: the installed live-bound skipper iterator, or null. */
+    LiveSkipBlockRangeIterator liveIterator;
+
+    /** K4: the live iterator does all the pruning, so updates only write the bound. */
+    boolean liveOnly;
+
     /** Are there documents in this segment with no value for the comparator to use */
     protected abstract boolean hasMissingDocs();
 
@@ -251,6 +265,9 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     /** Use a new iterator as the competitive iterator for collection */
     protected final void updateCompetitiveIterator(DocIdSetIterator iterator) {
       this.competitiveIterator.update(iterator);
+      if (hooks != null) {
+        hooks.onInstall(iterator);
+      }
     }
 
     /** Create a new CompetitiveDISIBuilder */
@@ -284,6 +301,16 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
       // if some documents have missing points, check that missing values prohibits optimization
       if (hasMissingDocs() && isMissingValueCompetitive()) {
         return;
+      }
+
+      if (liveIterator != null) {
+        // K4: the live iterator reads the bound at its next block, so write it on every update
+        if (queueFull) {
+          encodeBottom();
+        }
+        if (liveOnly) {
+          return;
+        }
       }
 
       updateCounter++;
@@ -488,8 +515,11 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     /** The points builder estimated the competitive point count. */
     default void onEstimate(int updateCounter) {}
 
-    /** The points builder installed an iterator over the intersected points. */
-    default void onIntersect(int updateCounter, DocIdSetIterator iterator) {}
+    /** The points builder installed an iterator over these intersected points. */
+    default void onIntersect(int updateCounter, DocIdSet points) {}
+
+    /** A builder installed {@code iterator} as the inner competitive iterator. */
+    default void onInstall(DocIdSetIterator iterator) {}
   }
 
   /** Read by every builder at leaf start; null in production. */
@@ -503,6 +533,11 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     private long iteratorCost = -1;
     // helps to be conservative about increasing the sampling interval
     private int tryUpdateFailCount = 0;
+    // K4 FALLBACK: the doc-values skipper of the field (lazily read), and whether a points
+    // iterator was installed in this leaf
+    private DocValuesSkipper skipper;
+    private boolean skipperLoaded;
+    private boolean pointsInstalled;
 
     PointsCompetitiveDISIBuilder(
         PointValues pointValues,
@@ -632,6 +667,19 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
           visitor, getPointTree(), threshold)) {
         // the new range is not selective enough to be worth materializing, it doesn't reduce number
         // of docs at least 8x
+        if (skipperMode == SkipperMode.FALLBACK && pointsInstalled == false && skipper() != null) {
+          // K4 FALLBACK: stock bookkeeping, but prune with the live-bound skipper iterator
+          // instead of the doc-values iterator until points become selective
+          updateSkipInterval(false);
+          if (pointValues.getDocCount() < iteratorCost) {
+            iteratorCost = pointValues.getDocCount();
+          }
+          if (liveIterator == null) {
+            liveIterator = new LiveSkipBlockRangeIterator(skipper, this);
+            updateCompetitiveIterator(liveIterator);
+          }
+          return;
+        }
         updateSkipInterval(false);
         if (pointValues.getDocCount() < iteratorCost) {
           // Use the set of doc with values to help drive iteration
@@ -642,13 +690,25 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
         return;
       }
       pointValues.intersect(visitor);
-      DocIdSetIterator newIterator = result.build().iterator();
+      DocIdSet points = result.build();
+      DocIdSetIterator newIterator = points.iterator();
       updateCompetitiveIterator(newIterator);
       iteratorCost = newIterator.cost();
       updateSkipInterval(true);
+      // K4 FALLBACK: once points are installed, follow stock for the rest of the leaf
+      pointsInstalled = true;
+      liveIterator = null;
       if (hooks != null) {
-        hooks.onIntersect(updateCounter, newIterator);
+        hooks.onIntersect(updateCounter, points);
       }
+    }
+
+    private DocValuesSkipper skipper() throws IOException {
+      if (skipperLoaded == false) {
+        skipper = leafComparator.context.reader().getDocValuesSkipper(field);
+        skipperLoaded = true;
+      }
+      return skipper;
     }
 
     private PointValues.PointTree getPointTree() throws IOException {
@@ -700,6 +760,15 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
 
     @Override
     protected void doUpdateCompetitiveIterator() {
+      if (skipperMode != SkipperMode.OFF) {
+        // K4: one live-bound iterator for the whole leaf; later updates only write the bound
+        if (liveIterator == null) {
+          liveIterator = new LiveSkipBlockRangeIterator(skipper, this);
+          updateCompetitiveIterator(liveIterator);
+        }
+        liveOnly = true;
+        return;
+      }
       updateCompetitiveIterator(
           new SkipBlockRangeIterator(skipper, minValueAsLong, maxValueAsLong));
     }
