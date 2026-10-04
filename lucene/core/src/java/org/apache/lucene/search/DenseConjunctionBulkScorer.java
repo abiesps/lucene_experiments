@@ -153,8 +153,12 @@ final class DenseConjunctionBulkScorer extends BulkScorer {
     List<DisiWrapper> iterators = this.iterators;
     if (collector.competitiveIterator() != null) {
       iterators = new ArrayList<>(iterators);
+      DocIdSetIterator competitiveIterator = collector.competitiveIterator();
+      if (CollectExperiments.isCompetitiveRunCap()) {
+        competitiveIterator = new RunCappedIterator(competitiveIterator);
+      }
       // the competitive iterator can drop docs while collecting, so its run end is not cached
-      iterators.add(new DisiWrapper(collector.competitiveIterator(), null, false));
+      iterators.add(new DisiWrapper(competitiveIterator, null, false));
     }
 
     for (DisiWrapper w : iterators) {
@@ -462,5 +466,28 @@ final class DenseConjunctionBulkScorer extends BulkScorer {
   @Override
   public long cost() {
     return iterators.get(0).approximation().cost();
+  }
+
+  /**
+   * Caps the run end of the collector's competitive iterator at one window, so a range of docs that
+   * all match is collected at most {@link #WINDOW_SIZE} docs at a time and the scorer sees a
+   * competitive iterator that was updated while collecting. Package-private for tests.
+   */
+  static final class RunCappedIterator extends FilterDocIdSetIterator {
+
+    RunCappedIterator(DocIdSetIterator in) {
+      super(in);
+    }
+
+    @Override
+    public int docIDRunEnd() throws IOException {
+      return (int) Math.min(in.docIDRunEnd(), (long) docID() + WINDOW_SIZE);
+    }
+
+    @Override
+    public void intoBitSet(int upTo, FixedBitSet bitSet, int offset) throws IOException {
+      // FilterDocIdSetIterator does not forward intoBitSet, and the default sets one doc at a time
+      in.intoBitSet(upTo, bitSet, offset);
+    }
   }
 }
