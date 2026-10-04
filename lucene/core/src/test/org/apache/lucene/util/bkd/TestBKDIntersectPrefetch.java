@@ -122,7 +122,7 @@ public class TestBKDIntersectPrefetch extends LuceneTestCase {
     }
   }
 
-  /** File offsets of reads and prefetches, per file, of the points data files. */
+  /** File offsets of reads and prefetches, per file, of the points files. */
   static final class Recording {
     final Map<String, List<long[]>> reads = new TreeMap<>();
     final Map<String, List<long[]>> prefetches = new TreeMap<>();
@@ -199,7 +199,7 @@ public class TestBKDIntersectPrefetch extends LuceneTestCase {
     @Override
     public IndexInput openInput(String name, IOContext context) throws IOException {
       IndexInput input = in.openInput(name, context);
-      return name.endsWith(".kdd") || name.endsWith(".kdv")
+      return name.endsWith(".kdd") || name.endsWith(".kdv") || name.endsWith(".kdi")
           ? new RecordingInput(name, input, 0, recording)
           : input;
     }
@@ -358,11 +358,18 @@ public class TestBKDIntersectPrefetch extends LuceneTestCase {
         String ctx = field + " [" + lo + ", " + hi + "] nodeBytes=" + nodeBytes;
         index.recording.assertAllPrefetchedRead(nodeBytes, ctx);
         int calls = index.recording.prefetchCalls();
-        assertTrue(ctx, calls > 0 || index.recording.reads.isEmpty());
+        boolean leavesRead = false;
+        for (String file : index.recording.reads.keySet()) {
+          leavesRead |= file.endsWith(".kdd");
+        }
+        assertTrue(ctx, calls > 0 || leavesRead == false);
         if (nodeBytes > BKDReader.maxValueSectionBytes(BKDConfig.of(1, 1, 8, 512))) {
           // coalesced: one run (or its inverse: at most two), each in at most `chunks` calls
           assertTrue(ctx + " calls=" + calls, calls <= 2 * chunks);
           for (String file : index.recording.reads.keySet()) {
+            if (file.endsWith(".kdd") == false) {
+              continue;
+            }
             // only an INSIDE-ended run can miss its last leaf's doc IDs past the first node
             assertTrue(
                 ctx + " missed " + index.recording.notPrefetched(file, nodeBytes),

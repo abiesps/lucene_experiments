@@ -337,6 +337,16 @@ public final class SplitBKDReader extends PointValues {
       this.in = in;
     }
 
+    /** Whether page {@code pageIndex} is decoded here, so getting it reads nothing. */
+    boolean contains(int pageIndex) {
+      for (Page page : pages) {
+        if (page != null && page.pageIndex == pageIndex) {
+          return true;
+        }
+      }
+      return false;
+    }
+
     Page get(int pageIndex) throws IOException {
       int victim = -1;
       for (int i = 0; i < SIZE; i++) {
@@ -379,6 +389,83 @@ public final class SplitBKDReader extends PointValues {
     final int deep = 2 * numLeaves - p;
     assert nodeID >= numLeaves && nodeID < 2 * numLeaves;
     return nodeID >= p ? nodeID - p : deep + nodeID - numLeaves;
+  }
+
+  /** End (exclusive) of directory page {@code p} in the index file. */
+  long pageEndFP(int p) {
+    return p + 1 < numPages ? pageFPs[p + 1] : directoryEndFP;
+  }
+
+  /**
+   * Index-file prefetch of pass 1 of {@link SplitBKDPointTree#prefetchIntersect}: the whole-section
+   * rule ({@link BKDExperiments#isWholeIndexPrefetch()}, sections of at most 2 storage nodes) and
+   * the child rule ({@link BKDExperiments#isIndexChildPrefetch()}). Each storage node is requested
+   * once, only when pass 1 will read it.
+   */
+  static final class IndexPrefetch {
+    private final IndexInput in;
+    private final long nodeBytes;
+    // child rule: any node; whole-section rule only: only this node (-1 = none)
+    private final boolean anyNode;
+    private final long secondNode;
+    private long[] requested = new long[4];
+    private int numRequested;
+
+    private IndexPrefetch(IndexInput in, long nodeBytes, boolean anyNode, long secondNode) {
+      this.in = in;
+      this.nodeBytes = nodeBytes;
+      this.anyNode = anyNode;
+      this.secondNode = secondNode;
+    }
+
+    /** Returns null if neither index switch applies to this field. */
+    static IndexPrefetch create(SplitBKDReader reader, long nodeBytes) throws IOException {
+      final boolean child = BKDExperiments.isIndexChildPrefetch();
+      final long firstNode = reader.indexStartFP / nodeBytes;
+      final long lastNode = (reader.directoryEndFP - 1) / nodeBytes;
+      final boolean whole =
+          BKDExperiments.isWholeIndexPrefetch()
+              && reader.directoryEndFP - reader.indexStartFP
+                  <= BKDExperiments.getWholeIndexPrefetchBytes()
+              && lastNode - firstNode <= 1;
+      if (child == false && whole == false) {
+        return null;
+      }
+      IndexPrefetch prefetch =
+          new IndexPrefetch(
+              reader.indexIn.clone(),
+              nodeBytes,
+              child,
+              whole && lastNode > firstNode ? lastNode : -1);
+      if (whole) {
+        // pass 1 reads the root first, always
+        prefetch.requestNode(firstNode);
+      }
+      return prefetch;
+    }
+
+    /** Requests the storage nodes of [start, end) of the index file that this rule allows. */
+    void request(long start, long end) throws IOException {
+      for (long node = start / nodeBytes; node <= (end - 1) / nodeBytes; node++) {
+        if (anyNode || node == secondNode) {
+          requestNode(node);
+        }
+      }
+    }
+
+    private void requestNode(long node) throws IOException {
+      for (int i = 0; i < numRequested; i++) {
+        if (requested[i] == node) {
+          return;
+        }
+      }
+      if (numRequested == requested.length) {
+        requested = ArrayUtil.grow(requested, numRequested + 1);
+      }
+      requested[numRequested++] = node;
+      final long start = node * nodeBytes;
+      in.prefetch(start, Math.min(nodeBytes, in.length() - start));
+    }
   }
 
   @Override
@@ -831,6 +918,104 @@ public final class SplitBKDReader extends PointValues {
         int count = leafNodes.readVInt();
         docIdsWriter.readInts(leafNodes, count, scratchIterator.docIDs);
         visitLeafValues(valNodes, count, visitor);
+      }
+    }
+
+    /**
+     * Pass 1 on a clone: makes the same {@code compare} calls on the same cells (tight bounds at
+     * leaves) as {@link PointValues#intersect(PointValues.IntersectVisitor)}, then prefetches the
+     * doc IDs of INSIDE nodes and CROSSES leaves and the values of CROSSES leaves. Directory pages
+     * of the leaves it tests are read synchronously, as pass 2 reads them. Does nothing unless
+     * {@link BKDExperiments#isIntersectPrefetch()}.
+     */
+    @Override
+    public void prefetchIntersect(PointValues.IntersectVisitor visitor) throws IOException {
+      if (BKDExperiments.isIntersectPrefetch() == false) {
+        return;
+      }
+      final long nodeBytes = BKDExperiments.getNodeBytes();
+      final IndexPrefetch index = IndexPrefetch.create(reader, nodeBytes);
+      final SplitBKDPointTree tree = (SplitBKDPointTree) clone();
+      final LeafRangePrefetcher docs = new LeafRangePrefetcher(nodeBytes);
+      final LeafRangePrefetcher values = new LeafRangePrefetcher(nodeBytes);
+      tree.collectIntersectRanges(visitor, docs, values, index);
+      final int chunks = BKDExperiments.getPrefetchChunks();
+      docs.issue(tree.leafNodes, chunks);
+      values.issue(tree.valNodes, chunks);
+    }
+
+    /**
+     * Traverses like {@code PointValues.intersect}. Every leaf block that the intersection reads is
+     * read whole (INSIDE: the doc IDs; CROSSES leaf: the doc IDs and the values), so the ranges are
+     * exact: an INSIDE node's doc IDs end where the next node's first leaf starts.
+     */
+    private void collectIntersectRanges(
+        PointValues.IntersectVisitor visitor,
+        LeafRangePrefetcher docs,
+        LeafRangePrefetcher values,
+        IndexPrefetch index)
+        throws IOException {
+      long pendingDocStart =
+          -1; // doc IDs of an INSIDE inner node, up to the next node's first leaf
+      while (true) {
+        final PointValues.Relation r = visitor.compare(getMinPackedValue(), getMaxPackedValue());
+        if (r == PointValues.Relation.CELL_CROSSES_QUERY && isLeafNode() == false) {
+          if (index != null) {
+            requestRightChild(visitor, index);
+          }
+          moveToChild();
+          continue;
+        }
+        final long nodeFP = leafBlockFPStack[level];
+        if (pendingDocStart != -1) {
+          docs.add(pendingDocStart, nodeFP);
+          pendingDocStart = -1;
+        }
+        if (r == PointValues.Relation.CELL_INSIDE_QUERY) {
+          if (isLeafNode()) {
+            docs.add(leafDocFP, leafDocFP + leafDocLen);
+          } else {
+            pendingDocStart = nodeFP;
+          }
+        } else if (r == PointValues.Relation.CELL_CROSSES_QUERY) {
+          docs.add(leafDocFP, leafDocFP + leafDocLen);
+          values.add(leafValFP, leafValFP + leafValLen);
+        }
+        while (moveToSibling() == false) {
+          if (moveToParent() == false) {
+            if (pendingDocStart != -1) {
+              if (nodeRoot == 1) {
+                docs.add(pendingDocStart, reader.docDataEndFP);
+              } else {
+                // the end of a subtree's last leaf is not known without its directory entry
+                docs.addNodeOf(pendingDocStart);
+              }
+            }
+            return;
+          }
+        }
+      }
+    }
+
+    /**
+     * Child rule, at an inner node that pass 1 descends into: if pass 1 will visit the right child
+     * (its cell {@code [split, max]} is not OUTSIDE), requests the index bytes that the visit reads
+     * (the child's node data and, for a leaf, its directory page) before pass 1 descends left.
+     */
+    private void requestRightChild(PointValues.IntersectVisitor visitor, IndexPrefetch index)
+        throws IOException {
+      if (visitor.compare(splitValuesStack[level], maxPackedValue)
+          == PointValues.Relation.CELL_OUTSIDE_QUERY) {
+        return;
+      }
+      final long nodeFP = reader.indexStartFP + rightNodePositions[level];
+      index.request(nodeFP, nodeFP + 1);
+      final int rightChild = 2 * nodeID + 1;
+      if (rightChild >= leafNodeOffset) {
+        final int page = leafIDOf(rightChild, leafNodeOffset) >>> reader.pageShift;
+        if (pageCache.contains(page) == false) {
+          index.request(reader.pageFPs[page], reader.pageEndFP(page));
+        }
       }
     }
 
