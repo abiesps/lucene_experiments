@@ -18,6 +18,7 @@ package org.apache.lucene.search.comparators;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import org.apache.lucene.document.Document;
@@ -46,10 +47,12 @@ import org.apache.lucene.search.IndexOrDocValuesQuery;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.lucene.search.Pruning;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.ScoreMode;
+import org.apache.lucene.search.SkipBlockRangeIterator;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.SortedNumericSelector;
@@ -62,6 +65,7 @@ import org.apache.lucene.search.TotalHits;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.tests.util.TestUtil;
+import org.apache.lucene.util.BitSetIterator;
 import org.apache.lucene.util.FixedBitSet;
 
 /**
@@ -76,8 +80,16 @@ public class TestComparatorExperiments extends LuceneTestCase {
 
   @Override
   public void tearDown() throws Exception {
+    NumericComparator.testHooks = null;
     resetSwitches();
     super.tearDown();
+  }
+
+  @Override
+  public void setUp() throws Exception {
+    super.setUp();
+    NumericComparator.testHooks = null;
+    resetSwitches();
   }
 
   static void resetSwitches() {
@@ -123,7 +135,331 @@ public class TestComparatorExperiments extends LuceneTestCase {
   }
 
   // ---------------------------------------------------------------------------------------------
+  // K2: doc-distance sampling with a trailing update
+
+  public void testSampleDocsSameResults() throws Exception {
+    assertSameResultsOnRandomIndices(
+        random -> {
+          ComparatorExperiments.setSampleDocs(
+              TestUtil.nextInt(random, ComparatorExperiments.MIN_SAMPLE_DOCS, 1 << 16));
+          CollectExperiments.setCompetitiveRunCap(random.nextBoolean());
+        },
+        false,
+        atLeast(3));
+  }
+
+  public void testSampleDocsTrailingUpdateWithoutRunCap() throws Exception {
+    assertTrailingUpdate(false);
+  }
+
+  public void testSampleDocsTrailingUpdateWithRunCap() throws Exception {
+    assertTrailingUpdate(true);
+  }
+
+  /**
+   * Two-run asc burst: the 500 replacements at the run-B entry span 500 doc IDs, so the
+   * doc-distance test skips the decisive one. The trailing update runs it within sampleDocs + one
+   * window, intersects points, and prunes the rest of run B.
+   */
+  private void assertTrailingUpdate(boolean runCap) throws Exception {
+    final int runDocs = 20 * 4096;
+    final int sampleDocs = 4096;
+    try (Directory dir = twoRunIndex(runDocs, runDocs);
+        DirectoryReader reader = DirectoryReader.open(dir)) {
+      final Sort sort = new Sort(new SortField(FIELD, SortField.Type.LONG));
+      final TopFieldDocs stock = search(reader, MatchAllDocsQuery.INSTANCE, sort, 500, null, 1000);
+      final int lastReplacementDoc = runDocs + 499;
+
+      for (boolean trailing : new boolean[] {true, false}) {
+        ComparatorExperiments.setSampleDocs(sampleDocs);
+        CollectExperiments.setCompetitiveRunCap(runCap);
+        final Recorder recorder = new Recorder();
+        recorder.trailingEnabled = trailing;
+        NumericComparator.testHooks = recorder;
+        final Delivered delivered = new Delivered(reader.maxDoc());
+        final TopFieldDocs actual =
+            search(reader, MatchAllDocsQuery.INSTANCE, sort, 500, null, 1000, delivered);
+        NumericComparator.testHooks = null;
+        resetSwitches();
+        assertSameTopDocs(stock, actual, 1000);
+
+        // the last attempt that ran at or before the last replacement: its due point
+        int lastAttemptDoc = -1;
+        for (int[] a : recorder.attempts) {
+          if (a[2] == 0 && a[0] <= lastReplacementDoc) {
+            lastAttemptDoc = Math.max(lastAttemptDoc, a[0]);
+          }
+        }
+        assertTrue(lastAttemptDoc >= runDocs); // the first 256 replacements attempt every time
+        final long bound = (long) lastAttemptDoc + sampleDocs + 4096;
+        int trailingInWindow = 0;
+        boolean intersected = false;
+        for (int i = 0; i < recorder.events.size(); i++) {
+          final int[] e = recorder.events.get(i);
+          if (e[0] == Recorder.ATTEMPT
+              && e[3] == 1
+              && e[1] >= lastReplacementDoc + 1
+              && e[1] <= bound) {
+            trailingInWindow++;
+            intersected |=
+                i + 2 < recorder.events.size()
+                    && recorder.events.get(i + 1)[0] == Recorder.ESTIMATE
+                    && recorder.events.get(i + 2)[0] == Recorder.INTERSECT;
+          }
+        }
+        if (trailing) {
+          assertTrue("trailing attempts " + recorder.attempts, trailingInWindow >= 1);
+          assertTrue("the trailing update intersects points", intersected);
+          assertTrue(
+              "delivered from run B " + delivered.countIn(runDocs, 2 * runDocs),
+              delivered.countIn(runDocs, 2 * runDocs) <= bound - runDocs + 1);
+        } else {
+          assertEquals(0, trailingInWindow);
+        }
+        assertFalse(recorder.runEnds.isEmpty());
+        for (int[] e : recorder.runEnds) {
+          final int doc = e[0], result = e[1], last = e[2], sample = e[3];
+          assertTrue(Arrays.toString(e), result > doc);
+          assertTrue(Arrays.toString(e), result <= (long) Math.max(last, doc) + sample);
+        }
+      }
+    }
+  }
+
+  public void testTrailingUpdateIteratorForwards() throws Exception {
+    final Random r = random();
+    ComparatorExperiments.setSampleDocs(ComparatorExperiments.MIN_SAMPLE_DOCS);
+    try (Directory dir = randomSingleSegment(r);
+        DirectoryReader reader = DirectoryReader.open(dir)) {
+      final LeafReaderContext ctx = reader.leaves().get(0);
+      final int maxDoc = ctx.reader().maxDoc();
+      for (int iter = 0; iter < 10; iter++) {
+        final int kind = r.nextInt(3);
+        final long lo = r.nextInt(600_000), hi = lo + r.nextInt(300_000);
+        final FixedBitSet bits = new FixedBitSet(maxDoc);
+        for (int i = 0; i < maxDoc; i++) {
+          if (r.nextInt(4) == 0) {
+            bits.set(i);
+          }
+        }
+        final IteratorFactory factory =
+            () ->
+                switch (kind) {
+                  case 0 -> new BitSetIterator(bits, bits.cardinality());
+                  case 1 -> DocIdSetIterator.all(maxDoc);
+                  default ->
+                      new SkipBlockRangeIterator(ctx.reader().getDocValuesSkipper(FIELD), lo, hi);
+                };
+        final NumericComparator<?>.NumericLeafComparator leaf = newLeafComparator(ctx, 10);
+        final NumericComparator<?>.CompetitiveDISIBuilder builder = leaf.competitiveDISIBuilder();
+        builder.updateCompetitiveIterator(factory.create());
+        final DocIdSetIterator wrapper = leaf.competitiveIterator();
+        assertEquals("TrailingUpdateIterator", wrapper.getClass().getSimpleName());
+        final DocIdSetIterator expected = factory.create();
+        final FixedBitSet expectedBits = new FixedBitSet(maxDoc + 1);
+        final FixedBitSet actualBits = new FixedBitSet(maxDoc + 1);
+        while (expected.docID() != DocIdSetIterator.NO_MORE_DOCS) {
+          switch (r.nextInt(3)) {
+            case 0 -> assertEquals(expected.nextDoc(), wrapper.nextDoc());
+            case 1 -> {
+              final int target = expected.docID() + 1 + r.nextInt(5000);
+              if (target >= maxDoc) {
+                assertEquals(expected.advance(maxDoc), wrapper.advance(maxDoc));
+              } else {
+                assertEquals(expected.advance(target), wrapper.advance(target));
+              }
+            }
+            default -> {
+              if (expected.docID() < 0) {
+                assertEquals(expected.nextDoc(), wrapper.nextDoc());
+              }
+              if (expected.docID() == DocIdSetIterator.NO_MORE_DOCS) {
+                break;
+              }
+              wrapper.docIDRunEnd();
+              assertEquals(expected.docID(), wrapper.docID());
+              final int doc = expected.docID();
+              final int offset = doc - r.nextInt(Math.min(doc, 100) + 1);
+              final int upTo = (int) Math.min(maxDoc + 1L, doc + 1L + r.nextInt(3 * 4096));
+              expected.intoBitSet(upTo, expectedBits, offset);
+              wrapper.intoBitSet(upTo, actualBits, offset);
+              assertEquals(expectedBits, actualBits);
+              expectedBits.clear();
+              actualBits.clear();
+            }
+          }
+          assertEquals(expected.docID(), wrapper.docID());
+        }
+      }
+
+      // a pending update that fires inside docIDRunEnd or intoBitSet
+      for (boolean inRunEnd : new boolean[] {true, false}) {
+        final Recorder recorder = new Recorder();
+        NumericComparator.testHooks = recorder;
+        final NumericComparator<?>.NumericLeafComparator leaf = newLeafComparator(ctx, 10);
+        NumericComparator.testHooks = null;
+        leaf.setScorer(
+            new Scorable() {
+              @Override
+              public float score() {
+                return 0;
+              }
+            });
+        leaf.setHitsThresholdReached();
+        for (int slot = 0; slot < 10; slot++) {
+          leaf.copy(slot, slot);
+        }
+        leaf.setBottom(r.nextInt(10));
+        final NumericComparator<?>.CompetitiveDISIBuilder builder = leaf.competitiveDISIBuilder();
+        final DocIdSetIterator wrapper = leaf.competitiveIterator();
+        final int start = wrapper.nextDoc();
+        if (start == DocIdSetIterator.NO_MORE_DOCS) {
+          continue;
+        }
+        builder.pendingUpdate = true;
+        builder.lastAttemptDoc = start - builder.sampleDocs;
+        final int attemptsBefore = recorder.attempts.size();
+        if (inRunEnd) {
+          final int end = wrapper.docIDRunEnd();
+          assertTrue(end > wrapper.docID());
+          assertEquals(start, wrapper.docID());
+        } else {
+          final int upTo = (int) Math.min(maxDoc, start + 1L + r.nextInt(3 * 4096));
+          final FixedBitSet bits = new FixedBitSet(maxDoc);
+          wrapper.intoBitSet(upTo, bits, 0);
+          assertTrue(wrapper.docID() >= upTo);
+        }
+        assertFalse(builder.pendingUpdate);
+        assertEquals(attemptsBefore + 1, recorder.attempts.size());
+        assertEquals(1, recorder.attempts.get(attemptsBefore)[2]);
+        final int before = wrapper.docID();
+        if (before != DocIdSetIterator.NO_MORE_DOCS) {
+          assertTrue(wrapper.nextDoc() > before);
+        }
+      }
+    }
+  }
+
+  public void testSizeTenControl() throws Exception {
+    // bursts below 256 updates: every variant prunes run B after its 10 replacements
+    final int runDocs = 20 * 4096;
+    try (Directory dir = twoRunIndex(runDocs, runDocs);
+        DirectoryReader reader = DirectoryReader.open(dir)) {
+      final Sort sort = new Sort(new SortField(FIELD, SortField.Type.LONG));
+      final TopFieldDocs stock = search(reader, MatchAllDocsQuery.INSTANCE, sort, 10, null, 1000);
+      for (SwitchSetter variant : sizeTenVariants()) {
+        variant.set(random());
+        CollectExperiments.setCompetitiveRunCap(true);
+        final Delivered delivered = new Delivered(reader.maxDoc());
+        final TopFieldDocs actual =
+            search(reader, MatchAllDocsQuery.INSTANCE, sort, 10, null, 1000, delivered);
+        resetSwitches();
+        assertSameTopDocs(stock, actual, 1000);
+        final long fromB = delivered.countIn(runDocs, 2 * runDocs);
+        assertTrue("delivered from run B " + fromB, fromB <= 10 + 2 * 4096);
+      }
+    }
+  }
+
+  List<SwitchSetter> sizeTenVariants() {
+    final List<SwitchSetter> variants = new ArrayList<>();
+    variants.add(random -> {}); // stock comparator (with the run cap, as every variant here)
+    variants.add(random -> ComparatorExperiments.setSampleDocs(65536));
+    return variants;
+  }
+
+  /** Records the hooks of every builder. */
+  static final class Recorder implements NumericComparator.TestHooks {
+    static final int ATTEMPT = 0, ESTIMATE = 1, INTERSECT = 2;
+    final List<int[]> attempts = new ArrayList<>(); // {doc, updateCounter, trailing}
+    final List<int[]> runEnds = new ArrayList<>(); // {doc, result, lastAttemptDoc, sampleDocs}
+    final List<Integer> estimates = new ArrayList<>(); // updateCounter
+    final List<Integer> intersects = new ArrayList<>(); // updateCounter
+    final List<DocIdSetIterator> intersected = new ArrayList<>();
+    final List<int[]> events = new ArrayList<>(); // {kind, doc or -1, updateCounter, trailing}
+    boolean trailingEnabled = true;
+
+    @Override
+    public void onAttempt(int doc, int updateCounter, boolean trailing) {
+      attempts.add(new int[] {doc, updateCounter, trailing ? 1 : 0});
+      events.add(new int[] {ATTEMPT, doc, updateCounter, trailing ? 1 : 0});
+    }
+
+    @Override
+    public void onDocIDRunEnd(int doc, int result, int lastAttemptDoc, int sampleDocs) {
+      runEnds.add(new int[] {doc, result, lastAttemptDoc, sampleDocs});
+    }
+
+    @Override
+    public boolean trailingUpdateEnabled() {
+      return trailingEnabled;
+    }
+
+    @Override
+    public void onEstimate(int updateCounter) {
+      estimates.add(updateCounter);
+      events.add(new int[] {ESTIMATE, -1, updateCounter, 0});
+    }
+
+    @Override
+    public void onIntersect(int updateCounter, DocIdSetIterator iterator) {
+      intersects.add(updateCounter);
+      intersected.add(iterator);
+      events.add(new int[] {INTERSECT, -1, updateCounter, 0});
+    }
+  }
+
+  interface IteratorFactory {
+    DocIdSetIterator create() throws IOException;
+  }
+
+  static NumericComparator<?>.NumericLeafComparator newLeafComparator(
+      LeafReaderContext ctx, int numHits) throws IOException {
+    final LongComparator comparator =
+        new LongComparator(numHits, FIELD, null, false, Pruning.GREATER_THAN_OR_EQUAL_TO);
+    return (NumericComparator<?>.NumericLeafComparator) comparator.getLeafComparator(ctx);
+  }
+
+  /**
+   * One segment: run A (values 1,000,000 + i) then run B (values j), both rising with the doc ID,
+   * every run-B value below every run-A value.
+   */
+  static Directory twoRunIndex(int runA, int runB) throws IOException {
+    final Directory dir = newDirectory();
+    try (IndexWriter w = new IndexWriter(dir, oneSegmentConfig())) {
+      for (int i = 0; i < runA; i++) {
+        w.addDocument(valueDoc(1_000_000L + i, true, true));
+      }
+      for (int j = 0; j < runB; j++) {
+        w.addDocument(valueDoc(j, true, true));
+      }
+    }
+    return dir;
+  }
+
+  static Directory randomSingleSegment(Random r) throws IOException {
+    final Directory dir = newDirectory();
+    final int numDocs = TestUtil.nextInt(r, 5000, 40_000);
+    final int runs = TestUtil.nextInt(r, 1, 5);
+    try (IndexWriter w = new IndexWriter(dir, oneSegmentConfig())) {
+      for (int i = 0; i < numDocs; i++) {
+        final int run = (int) ((long) i * runs / numDocs);
+        w.addDocument(
+            valueDoc(
+                (runs - run) * 100_000L + i % (numDocs / runs + 1) + r.nextInt(3), true, true));
+      }
+    }
+    return dir;
+  }
+
+  // ---------------------------------------------------------------------------------------------
   // shared helpers
+
+  static TopFieldDocs search(
+      IndexReader reader, Query query, Sort sort, int size, FieldDoc after, int threshold)
+      throws IOException {
+    return search(reader, query, sort, size, after, threshold, null);
+  }
 
   /** Docs that reached the leaf collector, by top-level doc ID. */
   static final class Delivered {

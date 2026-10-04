@@ -32,7 +32,9 @@ import org.apache.lucene.search.Pruning;
 import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.SkipBlockRangeIterator;
+import org.apache.lucene.search.comparators.ComparatorExperiments.SkipperMode;
 import org.apache.lucene.util.DocIdSetBuilder;
+import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.IntsRef;
 
 /**
@@ -110,16 +112,24 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
       if (pruning == Pruning.NONE) {
         return null;
       }
+      // the experiment switches can change while a leaf is collected: read them once per leaf
+      final int sampleDocs = ComparatorExperiments.getSampleDocs();
+      final SkipperMode skipperMode = ComparatorExperiments.getSkipperMode();
       LeafReader reader = context.reader();
       PointValues pointValues = reader.getPointValues(field);
       if (pointValues != null) {
-        return new PointsCompetitiveDISIBuilder(pointValues, this);
+        return new PointsCompetitiveDISIBuilder(pointValues, this, sampleDocs, skipperMode);
       }
       DocValuesSkipper skipper = reader.getDocValuesSkipper(field);
       if (skipper != null) {
-        return new DVSkipperCompetitiveDISIBuilder(skipper, this);
+        return new DVSkipperCompetitiveDISIBuilder(skipper, this, sampleDocs, skipperMode);
       }
       return null;
+    }
+
+    /** The competitive iterator builder of this leaf, or null. For tests. */
+    CompetitiveDISIBuilder competitiveDISIBuilder() {
+      return competitiveDISIBuilder;
     }
 
     /**
@@ -171,7 +181,11 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
 
     @Override
     public DocIdSetIterator competitiveIterator() {
-      return competitiveDISIBuilder == null ? null : competitiveDISIBuilder.competitiveIterator;
+      if (competitiveDISIBuilder == null) {
+        return null;
+      }
+      final TrailingUpdateIterator trailing = competitiveDISIBuilder.trailingIterator;
+      return trailing != null ? trailing : competitiveDISIBuilder.competitiveIterator;
     }
 
     protected abstract long bottomAsComparableLong();
@@ -203,6 +217,27 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     int updateCounter = 0;
     int currentSkipInterval = MIN_SKIP_INTERVAL;
 
+    /**
+     * K2 ({@link ComparatorExperiments#getSampleDocs()} at leaf start): after 256 updates, attempts
+     * are spaced by at least this many doc IDs. 0 = stock sampling.
+     */
+    final int sampleDocs;
+
+    /** {@link ComparatorExperiments#getSkipperMode()} at leaf start. */
+    final SkipperMode skipperMode;
+
+    /** K2: the doc of the last update attempt that ran. */
+    int lastAttemptDoc = -1;
+
+    /** K2: an update passed every check but was skipped by the doc-distance test. */
+    boolean pendingUpdate;
+
+    /** K2: runs a skipped update once the scorer reaches its due point; null when K2 is off. */
+    final TrailingUpdateIterator trailingIterator;
+
+    /** Test hooks, read once at leaf start. */
+    final TestHooks hooks = testHooks;
+
     /** Are there documents in this segment with no value for the comparator to use */
     protected abstract boolean hasMissingDocs();
 
@@ -220,8 +255,16 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
 
     /** Create a new CompetitiveDISIBuilder */
     protected CompetitiveDISIBuilder(NumericLeafComparator leafComparator) {
+      this(leafComparator, 0, SkipperMode.OFF);
+    }
+
+    CompetitiveDISIBuilder(
+        NumericLeafComparator leafComparator, int sampleDocs, SkipperMode skipperMode) {
       this.leafComparator = leafComparator;
       this.maxDoc = leafComparator.context.reader().maxDoc();
+      this.sampleDocs = sampleDocs;
+      this.skipperMode = skipperMode;
+      this.trailingIterator = sampleDocs > 0 ? new TrailingUpdateIterator(this) : null;
       this.competitiveIterator.update(DocIdSetIterator.all(maxDoc));
       if (leafTopSet) {
         encodeTop();
@@ -244,9 +287,18 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
       }
 
       updateCounter++;
-      // Start sampling if we get called too much
-      if (updateCounter > 256
+      if (sampleDocs > 0) {
+        // K2: after 256 updates, space the attempts by doc distance; a skipped update stays
+        // pending and runs when the scorer reaches its due point (TrailingUpdateIterator)
+        if (updateCounter > 256 && maxDocVisited - lastAttemptDoc < sampleDocs) {
+          pendingUpdate = true;
+          return;
+        }
+        lastAttemptDoc = maxDocVisited;
+        pendingUpdate = false;
+      } else if (updateCounter > 256
           && (updateCounter & (currentSkipInterval - 1)) != currentSkipInterval - 1) {
+        // Start sampling if we get called too much
         return;
       }
 
@@ -254,7 +306,32 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
         encodeBottom();
       }
 
+      if (hooks != null) {
+        hooks.onAttempt(maxDocVisited, updateCounter, false);
+      }
       doUpdateCompetitiveIterator();
+    }
+
+    /**
+     * K2: runs the pending update if {@code target} is at least {@code sampleDocs} doc IDs past the
+     * last attempt. The checks that passed at the skip still pass: during a leaf the bottom only
+     * becomes more competitive.
+     */
+    private void runPendingUpdate(int target) throws IOException {
+      if (pendingUpdate && target < maxDoc && (long) target - lastAttemptDoc >= sampleDocs) {
+        if (hooks != null && hooks.trailingUpdateEnabled() == false) {
+          return;
+        }
+        lastAttemptDoc = target;
+        pendingUpdate = false;
+        if (queueFull) {
+          encodeBottom();
+        }
+        if (hooks != null) {
+          hooks.onAttempt(target, updateCounter, true);
+        }
+        doUpdateCompetitiveIterator();
+      }
     }
 
     private void setMaxDocVisited(int maxDocVisited) {
@@ -334,6 +411,90 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     }
   }
 
+  /**
+   * K2: the competitive iterator while doc-distance sampling is on. It forwards to the builder's
+   * {@link UpdateableDocIdSetIterator} and runs a pending update before it moves, and caps every
+   * run at the next point where a skipped update could be due, so the scorer calls it again there
+   * even inside a range of docs that all match.
+   */
+  private final class TrailingUpdateIterator extends DocIdSetIterator {
+    private final CompetitiveDISIBuilder builder;
+    private final UpdateableDocIdSetIterator in;
+
+    TrailingUpdateIterator(CompetitiveDISIBuilder builder) {
+      this.builder = builder;
+      this.in = builder.competitiveIterator;
+    }
+
+    @Override
+    public int docID() {
+      return in.docID();
+    }
+
+    @Override
+    public int nextDoc() throws IOException {
+      return advance(in.docID() + 1);
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+      builder.runPendingUpdate(target);
+      return in.advance(target);
+    }
+
+    @Override
+    public void intoBitSet(int upTo, FixedBitSet bitSet, int offset) throws IOException {
+      builder.runPendingUpdate(in.docID());
+      in.intoBitSet(upTo, bitSet, offset);
+    }
+
+    @Override
+    public int docIDRunEnd() throws IOException {
+      final int doc = docID();
+      builder.runPendingUpdate(doc);
+      final int end = in.docIDRunEnd();
+      // the next point where a skipped update could be due
+      long due = (long) builder.lastAttemptDoc + builder.sampleDocs;
+      if (due <= doc) {
+        // no attempt is due yet: still end within sampleDocs
+        due = (long) doc + builder.sampleDocs;
+      }
+      final int result = (int) Math.min(end, due);
+      if (builder.hooks != null) {
+        builder.hooks.onDocIDRunEnd(doc, result, builder.lastAttemptDoc, builder.sampleDocs);
+      }
+      return result;
+    }
+
+    @Override
+    public long cost() {
+      return in.cost();
+    }
+  }
+
+  /** Test hooks into the competitive iterator builders. Package-private, for tests only. */
+  interface TestHooks {
+    /** An update attempt is about to run at {@code doc}; {@code trailing} for a K2 pending one. */
+    default void onAttempt(int doc, int updateCounter, boolean trailing) {}
+
+    /** K2 {@link TrailingUpdateIterator#docIDRunEnd()} returned {@code result}. */
+    default void onDocIDRunEnd(int doc, int result, int lastAttemptDoc, int sampleDocs) {}
+
+    /** False disables the K2 trailing update. */
+    default boolean trailingUpdateEnabled() {
+      return true;
+    }
+
+    /** The points builder estimated the competitive point count. */
+    default void onEstimate(int updateCounter) {}
+
+    /** The points builder installed an iterator over the intersected points. */
+    default void onIntersect(int updateCounter, DocIdSetIterator iterator) {}
+  }
+
+  /** Read by every builder at leaf start; null in production. */
+  static volatile TestHooks testHooks;
+
   private class PointsCompetitiveDISIBuilder extends CompetitiveDISIBuilder {
 
     private final PointValues pointValues;
@@ -343,8 +504,12 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     // helps to be conservative about increasing the sampling interval
     private int tryUpdateFailCount = 0;
 
-    PointsCompetitiveDISIBuilder(PointValues pointValues, NumericLeafComparator comparator) {
-      super(comparator);
+    PointsCompetitiveDISIBuilder(
+        PointValues pointValues,
+        NumericLeafComparator comparator,
+        int sampleDocs,
+        SkipperMode skipperMode) {
+      super(comparator, sampleDocs, skipperMode);
       LeafReaderContext context = comparator.context;
       FieldInfo info = context.reader().getFieldInfos().fieldInfo(field);
       if (info == null || info.getPointDimensionCount() == 0) {
@@ -460,6 +625,9 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
 
       final long threshold = iteratorCost >>> 3;
 
+      if (hooks != null) {
+        hooks.onEstimate(updateCounter);
+      }
       if (PointValues.isEstimatedPointCountGreaterThanOrEqualTo(
           visitor, getPointTree(), threshold)) {
         // the new range is not selective enough to be worth materializing, it doesn't reduce number
@@ -478,6 +646,9 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
       updateCompetitiveIterator(newIterator);
       iteratorCost = newIterator.cost();
       updateSkipInterval(true);
+      if (hooks != null) {
+        hooks.onIntersect(updateCounter, newIterator);
+      }
     }
 
     private PointValues.PointTree getPointTree() throws IOException {
@@ -509,8 +680,11 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     private final DocValuesSkipper skipper;
 
     DVSkipperCompetitiveDISIBuilder(
-        DocValuesSkipper skipper, NumericLeafComparator leafComparator) {
-      super(leafComparator);
+        DocValuesSkipper skipper,
+        NumericLeafComparator leafComparator,
+        int sampleDocs,
+        SkipperMode skipperMode) {
+      super(leafComparator, sampleDocs, skipperMode);
       this.skipper = skipper;
     }
 
