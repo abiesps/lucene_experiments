@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import org.apache.lucene.search.comparators.ComparatorExperiments;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.MathUtil;
@@ -130,7 +131,15 @@ final class DenseConjunctionBulkScorer extends BulkScorer {
     }
     this.maxDoc = maxDoc;
     this.iterators = new ArrayList<>();
-    final boolean cacheRunEnd = CollectExperiments.isCacheRunEnd();
+    // The comparator experiments (K2 run-end cap, K3 run cap, K4 skipper blocks) end competitive
+    // runs every few thousand docs. Each window then asks every clause for its run end again,
+    // which costs O(run length) for a bit set whose run spans most of the segment, so the query
+    // clauses (whose matches do not change while collecting) keep their run end.
+    final boolean cacheRunEnd =
+        CollectExperiments.isCacheRunEnd()
+            || CollectExperiments.isCompetitiveRunCap()
+            || ComparatorExperiments.getSampleDocs() > 0
+            || ComparatorExperiments.getSkipperMode() != ComparatorExperiments.SkipperMode.OFF;
     for (DocIdSetIterator iterator : iterators) {
       this.iterators.add(new DisiWrapper(iterator, cacheRunEnd));
     }
