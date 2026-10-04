@@ -1615,6 +1615,16 @@ public class AssertingLeafReader extends FilterLeafReader {
               pointValues.getBytesPerDimension(),
               visitor));
     }
+
+    @Override
+    public void prefetchIntersect(IntersectVisitor visitor) throws IOException {
+      final byte[] min = in.getMinPackedValue().clone();
+      final byte[] max = in.getMaxPackedValue().clone();
+      in.prefetchIntersect(visitor);
+      // the tree must be left on the node it was on
+      assert Arrays.equals(min, in.getMinPackedValue());
+      assert Arrays.equals(max, in.getMaxPackedValue());
+    }
   }
 
   /**
@@ -1733,6 +1743,11 @@ public class AssertingLeafReader extends FilterLeafReader {
       System.arraycopy(minPackedValue, 0, lastMinPackedValue, 0, numIndexDims * bytesPerDim);
       lastCompareResult = in.compare(minPackedValue, maxPackedValue);
       return lastCompareResult;
+    }
+
+    @Override
+    public boolean prefetchIntersect() {
+      return in.prefetchIntersect();
     }
   }
 

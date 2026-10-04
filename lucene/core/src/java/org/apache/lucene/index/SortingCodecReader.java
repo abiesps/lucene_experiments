@@ -177,6 +177,11 @@ public final class SortingCodecReader extends FilterCodecReader {
       sortingIntersectVisitor.setIntersectVisitor(visitor);
       indexTree.visitDocValues(sortingIntersectVisitor);
     }
+
+    @Override
+    public void prefetchIntersect(PointValues.IntersectVisitor visitor) throws IOException {
+      indexTree.prefetchIntersect(visitor);
+    }
   }
 
   private static class SortingIntersectVisitor implements PointValues.IntersectVisitor {
@@ -206,6 +211,11 @@ public final class SortingCodecReader extends FilterCodecReader {
     @Override
     public PointValues.Relation compare(byte[] minPackedValue, byte[] maxPackedValue) {
       return visitor.compare(minPackedValue, maxPackedValue);
+    }
+
+    @Override
+    public boolean prefetchIntersect() {
+      return visitor.prefetchIntersect();
     }
   }
 

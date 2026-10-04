@@ -218,16 +218,32 @@ public class BKDReader extends PointValues {
 
   @Override
   public PointTree getPointTree() throws IOException {
-    return new BKDPointTree(
-        indexIn.slice("packedIndex", indexStartPointer, numIndexBytes),
-        this.in.clone(),
-        config,
-        numLeaves,
-        version,
-        pointCount,
-        minPackedValue,
-        maxPackedValue,
-        isTreeBalanced);
+    BKDPointTree tree =
+        new BKDPointTree(
+            indexIn.slice("packedIndex", indexStartPointer, numIndexBytes),
+            this.in.clone(),
+            config,
+            numLeaves,
+            version,
+            pointCount,
+            minPackedValue,
+            maxPackedValue,
+            isTreeBalanced);
+    tree.leafDataEnd = leafDataEnd;
+    return tree;
+  }
+
+  /**
+   * Largest number of bytes that the values part of one leaf block can take, from {@link
+   * BKDWriter}'s leaf encoding: per point at most {@code packedBytesLength - 1} suffix bytes plus 2
+   * run-length bytes, the common prefixes (VInt length and prefix bytes per dimension), the
+   * encoding byte and, with more than one index dimension, the leaf bounds.
+   */
+  static long maxValueSectionBytes(BKDConfig config) {
+    return (long) config.maxPointsInLeafNode() * (config.packedBytesLength() + 1)
+        + (long) config.numDims() * (5 + config.bytesPerDim())
+        + 1
+        + (config.numIndexDims() > 1 ? 2L * config.packedIndexBytesLength() : 0);
   }
 
   private static class BKDPointTree implements PointTree {
@@ -282,6 +298,8 @@ public class BKDReader extends PointValues {
     // if true the tree is balanced, otherwise unbalanced
     private final boolean isTreeBalanced;
     private final IntsRef scratchIntsRef = new IntsRef();
+    // end (exclusive) of the field's leaf blocks in the data file, -1 if unknown
+    private long leafDataEnd = -1;
 
     {
       assert scratchIntsRef.offset == 0;
@@ -393,6 +411,7 @@ public class BKDReader extends PointValues {
               scratchMaxIndexPackedValue,
               commonPrefixLengths,
               isTreeBalanced);
+      index.leafDataEnd = leafDataEnd;
       index.leafBlockFPStack[index.level] = leafBlockFPStack[level];
       if (isLeafNode() == false) {
         // copy node data
@@ -654,6 +673,140 @@ public class BKDReader extends PointValues {
     public void visitDocValues(PointValues.IntersectVisitor visitor) throws IOException {
       resetNodeDataPosition();
       visitLeavesOneByOne(visitor);
+    }
+
+    /**
+     * Pass 1 on a clone: makes the same {@code compare} calls on the same cells as {@link
+     * PointValues#intersect(PointValues.IntersectVisitor)}, collects the leaf ranges that the
+     * intersection will read and prefetches them. Does nothing unless {@link
+     * BKDExperiments#isIntersectPrefetch()}.
+     */
+    @Override
+    public void prefetchIntersect(PointValues.IntersectVisitor visitor) throws IOException {
+      if (BKDExperiments.isIntersectPrefetch() == false) {
+        return;
+      }
+      final long nodeBytes = BKDExperiments.getNodeBytes();
+      final BKDPointTree tree = (BKDPointTree) clone();
+      final LeafRangePrefetcher ranges = new LeafRangePrefetcher(nodeBytes);
+      tree.collectIntersectRanges(visitor, ranges, maxValueSectionBytes(config) < nodeBytes);
+      ranges.issue(tree.leafNodes, BKDExperiments.getPrefetchChunks());
+    }
+
+    /**
+     * Traverses like {@code PointValues.intersect} and adds to {@code ranges} the leaf bytes that
+     * the intersection reads. INSIDE leaves read their count and doc IDs but not their values, so a
+     * range of whole leaves is requested only if {@code coalesce} (no value section can cover a
+     * whole storage node); otherwise INSIDE leaves get the node of their start only.
+     */
+    private void collectIntersectRanges(
+        PointValues.IntersectVisitor visitor, LeafRangePrefetcher ranges, boolean coalesce)
+        throws IOException {
+      // with one index dimension a CROSSES leaf reads all its bytes; with more, it re-checks its
+      // own bounds and may stop after them
+      final boolean crossesReadsAll = config.numIndexDims() == 1;
+      long runStart = -1; // coalesce: start of the open run of leaves
+      long lastLeafFP =
+          -1; // coalesce: start of the open run's last leaf; else a pending CROSSES leaf
+      boolean lastCrosses = false;
+      while (true) {
+        final PointValues.Relation r = visitor.compare(getMinPackedValue(), getMaxPackedValue());
+        if (r == PointValues.Relation.CELL_CROSSES_QUERY && moveToChild()) {
+          continue;
+        }
+        final long nodeFP = leftmostLeafFP();
+        if (coalesce) {
+          if (r == PointValues.Relation.CELL_OUTSIDE_QUERY) {
+            if (runStart != -1) {
+              ranges.add(runStart, runEnd(lastLeafFP, lastCrosses && crossesReadsAll, nodeFP));
+              runStart = -1;
+            }
+          } else {
+            if (runStart == -1) {
+              runStart = nodeFP;
+            }
+            lastCrosses = r == PointValues.Relation.CELL_CROSSES_QUERY;
+            lastLeafFP = lastCrosses ? nodeFP : rightmostLeafFP();
+          }
+        } else {
+          if (lastLeafFP != -1) {
+            // the pending CROSSES leaf ends where this node's first leaf starts
+            ranges.add(lastLeafFP, nodeFP);
+            lastLeafFP = -1;
+          }
+          if (r == PointValues.Relation.CELL_INSIDE_QUERY) {
+            addLeafStartNodes(ranges);
+          } else if (r == PointValues.Relation.CELL_CROSSES_QUERY) {
+            if (crossesReadsAll) {
+              lastLeafFP = nodeFP;
+            } else {
+              ranges.addNodeOf(nodeFP);
+            }
+          }
+        }
+        while (moveToSibling() == false) {
+          if (moveToParent() == false) {
+            // the field's data end is the next leaf only if this traversal started at the root
+            final long end = nodeRoot == 1 ? leafDataEnd : -1;
+            if (coalesce) {
+              if (runStart != -1) {
+                ranges.add(runStart, runEnd(lastLeafFP, lastCrosses && crossesReadsAll, end));
+              }
+            } else if (lastLeafFP != -1) {
+              if (end != -1) {
+                ranges.add(lastLeafFP, end);
+              } else {
+                ranges.addNodeOf(lastLeafFP);
+              }
+            }
+            return;
+          }
+        }
+      }
+    }
+
+    /**
+     * End of a run whose last leaf starts at {@code lastLeafFP}: the start of the next leaf if the
+     * last leaf is read whole and the next leaf is known, else the end of the storage node that
+     * holds the last leaf's start.
+     */
+    private static long runEnd(long lastLeafFP, boolean lastReadWhole, long nextLeafFP) {
+      if (lastReadWhole && nextLeafFP != -1) {
+        return nextLeafFP;
+      }
+      return lastLeafFP + 1;
+    }
+
+    /** File pointer of the leftmost leaf below the current node. */
+    private long leftmostLeafFP() {
+      return leafBlockFPStack[level];
+    }
+
+    /** File pointer of the rightmost leaf below the current node; returns to the current node. */
+    private long rightmostLeafFP() throws IOException {
+      int depth = 0;
+      while (moveToChild()) {
+        final boolean moved = moveToSibling();
+        assert moved;
+        depth++;
+      }
+      final long fp = leftmostLeafFP();
+      for (; depth > 0; depth--) {
+        moveToParent();
+      }
+      return fp;
+    }
+
+    /** Adds the storage node of each leaf's start below the current node. */
+    private void addLeafStartNodes(LeafRangePrefetcher ranges) throws IOException {
+      if (moveToChild()) {
+        do {
+          addLeafStartNodes(ranges);
+        } while (moveToSibling());
+        moveToParent();
+      } else {
+        ranges.addNodeOf(leftmostLeafFP());
+      }
     }
 
     private void visitLeavesOneByOne(PointValues.IntersectVisitor visitor) throws IOException {

@@ -783,6 +783,12 @@ public class ExitableDirectoryReader extends FilterDirectoryReader {
       exitableIntersectVisitor.setIntersectVisitor(visitor);
       in.visitDocValues(exitableIntersectVisitor);
     }
+
+    @Override
+    public void prefetchIntersect(PointValues.IntersectVisitor visitor) throws IOException {
+      checkAndThrow();
+      in.prefetchIntersect(visitor);
+    }
   }
 
   private static class ExitableIntersectVisitor implements PointValues.IntersectVisitor {
@@ -846,6 +852,11 @@ public class ExitableDirectoryReader extends FilterDirectoryReader {
     public void grow(int count) {
       checkAndThrow();
       in.grow(count);
+    }
+
+    @Override
+    public boolean prefetchIntersect() {
+      return in.prefetchIntersect();
     }
   }
 

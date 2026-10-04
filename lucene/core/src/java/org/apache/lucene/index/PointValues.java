@@ -274,6 +274,16 @@ public abstract class PointValues {
 
     /** Visit all the docs and values below the current node. */
     void visitDocValues(IntersectVisitor visitor) throws IOException;
+
+    /**
+     * Asks the storage to load, in the background, the leaf data that {@link
+     * PointValues#intersect(IntersectVisitor)} will read below the current node with this visitor.
+     * Called only when {@link IntersectVisitor#prefetchIntersect()} returns true. It must leave
+     * this tree on the node it was on (implementations work on a clone). The default does nothing.
+     *
+     * @lucene.experimental
+     */
+    default void prefetchIntersect(IntersectVisitor visitor) throws IOException {}
   }
 
   /**
@@ -339,6 +349,18 @@ public abstract class PointValues {
 
     /** Notifies the caller that this many documents are about to be visited */
     default void grow(int count) {}
+
+    /**
+     * Returns true only if {@link #compare} is pure (no side effects, same answer for the same cell
+     * during one intersect) and the caller reads every leaf that {@link
+     * PointValues#intersect(IntersectVisitor)} reaches (no early termination). Then intersect may
+     * prefetch those leaves before it reads them. The default is false.
+     *
+     * @lucene.experimental
+     */
+    default boolean prefetchIntersect() {
+      return false;
+    }
   }
 
   /**
@@ -347,6 +369,9 @@ public abstract class PointValues {
    */
   public final void intersect(IntersectVisitor visitor) throws IOException {
     final PointTree pointTree = getPointTree();
+    if (visitor.prefetchIntersect()) {
+      pointTree.prefetchIntersect(visitor);
+    }
     intersect(visitor, pointTree);
     assert pointTree.moveToParent() == false;
   }

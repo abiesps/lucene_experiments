@@ -189,6 +189,12 @@ public abstract class PointRangeQuery extends Query {
           public Relation compare(byte[] minPackedValue, byte[] maxPackedValue) {
             return relate(minPackedValue, maxPackedValue);
           }
+
+          @Override
+          public boolean prefetchIntersect() {
+            // compare is pure and every reached leaf is read
+            return true;
+          }
         };
       }
 
@@ -244,6 +250,12 @@ public abstract class PointRangeQuery extends Query {
               default:
                 return relation;
             }
+          }
+
+          @Override
+          public boolean prefetchIntersect() {
+            // compare is pure and every reached leaf is read
+            return true;
           }
         };
       }

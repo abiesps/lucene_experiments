@@ -449,6 +449,13 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
               }
               return PointValues.Relation.CELL_INSIDE_QUERY;
             }
+
+            @Override
+            public boolean prefetchIntersect() {
+              // compare reads bounds that do not change during one intersect, and visit drops
+              // docs only after their leaf is read
+              return true;
+            }
           };
 
       final long threshold = iteratorCost >>> 3;
