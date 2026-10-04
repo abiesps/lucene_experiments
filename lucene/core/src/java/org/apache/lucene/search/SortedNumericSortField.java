@@ -212,6 +212,11 @@ public class SortedNumericSortField extends SortField {
     return type;
   }
 
+  @Override
+  SortField.Type competitiveBoundsType() {
+    return type;
+  }
+
   /** Returns the selector in use for this sort */
   public SortedNumericSelector.Type getSelector() {
     return selector;
@@ -332,6 +337,7 @@ public class SortedNumericSortField extends SortField {
                 };
               }
             };
+        applyCompetitiveBounds(fieldComparator);
         break;
       case DOUBLE:
         fieldComparator =

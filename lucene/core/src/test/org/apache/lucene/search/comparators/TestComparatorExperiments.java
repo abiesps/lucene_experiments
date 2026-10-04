@@ -521,6 +521,154 @@ public class TestComparatorExperiments extends LuceneTestCase {
     }
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // K1: clamp to the query's range on the sort field
+
+  public void testClampSameResults() throws Exception {
+    assertSameResultsWithClamp(false, atLeast(3));
+  }
+
+  public void testClampMultiValuedNotApplied() throws Exception {
+    assertSameResultsWithClamp(true, atLeast(2));
+  }
+
+  /** asc window inside an ascending run: the clamp makes the competitive range selective. */
+  public void testClampCollectsFewerDocsInAscWindow() throws Exception {
+    final int numDocs = 100_000;
+    try (Directory dir = newDirectory()) {
+      try (IndexWriter w = new IndexWriter(dir, oneSegmentConfig())) {
+        for (int i = 0; i < numDocs; i++) {
+          w.addDocument(valueDoc(i, true, true));
+        }
+      }
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        final long lo = numDocs / 2, hi = lo + 30_000;
+        final Query query = LongPoint.newRangeQuery(FIELD, lo, hi);
+        CollectExperiments.setCompetitiveRunCap(true);
+        final Delivered stockDelivered = new Delivered(reader.maxDoc());
+        final TopFieldDocs stock =
+            search(
+                reader,
+                query,
+                new Sort(new SortField(FIELD, SortField.Type.LONG)),
+                10,
+                null,
+                10,
+                stockDelivered);
+        final SortField clamped = new SortField(FIELD, SortField.Type.LONG);
+        clamped.setCompetitiveBounds(lo, hi);
+        final Recorder recorder = new Recorder();
+        NumericComparator.testHooks = recorder;
+        final Delivered delivered = new Delivered(reader.maxDoc());
+        final TopFieldDocs actual =
+            search(reader, query, new Sort(clamped), 10, null, 10, delivered);
+        NumericComparator.testHooks = null;
+        assertSameTopDocs(stock, actual, 10);
+        assertEquals(hi - lo + 1, stockDelivered.count);
+        assertTrue("delivered " + delivered.count, delivered.count <= 10 + 2 * 4096);
+        assertTrue(recorder.clamps.contains(true));
+      }
+    }
+  }
+
+  public void testCompetitiveBoundsNeedLongSort() {
+    expectThrows(
+        IllegalArgumentException.class,
+        () -> new SortField(FIELD, SortField.Type.INT).setCompetitiveBounds(0, 1));
+    expectThrows(
+        IllegalArgumentException.class,
+        () -> new SortedNumericSortField(FIELD, SortField.Type.DOUBLE).setCompetitiveBounds(0, 1));
+    final SortField a = new SortField(FIELD, SortField.Type.LONG);
+    final SortField b = new SortField(FIELD, SortField.Type.LONG);
+    b.setCompetitiveBounds(0, 1);
+    assertEquals(a, b);
+    assertEquals(a.hashCode(), b.hashCode());
+  }
+
+  /**
+   * Random range queries on the sort field (alone, as IndexOrDocValuesQuery, or with a term
+   * filter); the variant's sort field carries the query's range as competitive bounds. On a
+   * multi-valued index the clamp is never applied.
+   */
+  private void assertSameResultsWithClamp(boolean multiValued, int numIndices) throws IOException {
+    final Random r = random();
+    for (int n = 0; n < numIndices; n++) {
+      try (Directory dir = randomIndex(r, multiValued);
+          DirectoryReader reader = DirectoryReader.open(dir)) {
+        boolean anyMultiValuedSegment = false;
+        for (LeafReaderContext ctx : reader.leaves()) {
+          final org.apache.lucene.index.PointValues pv = ctx.reader().getPointValues(FIELD);
+          anyMultiValuedSegment |= pv != null && pv.size() != pv.getDocCount();
+        }
+        for (int q = 0; q < 10; q++) {
+          final long lo = r.nextInt(1_200_000), hi = lo + r.nextInt(400_000);
+          final Query range = LongPoint.newRangeQuery(FIELD, lo, hi);
+          final Query query =
+              switch (r.nextInt(3)) {
+                case 0 -> range;
+                case 1 ->
+                    new IndexOrDocValuesQuery(
+                        range, SortedNumericDocValuesField.newSlowRangeQuery(FIELD, lo, hi));
+                default ->
+                    new ConstantScoreQuery(
+                        new BooleanQuery.Builder()
+                            .add(
+                                new TermQuery(new Term(SEL, "s" + r.nextInt(10))),
+                                BooleanClause.Occur.FILTER)
+                            .add(range, BooleanClause.Occur.FILTER)
+                            .build());
+              };
+          final SortField stockField = randomSortField(r, multiValued);
+          final SortField variantField = copy(stockField);
+          variantField.setCompetitiveBounds(lo, hi);
+          final int size = r.nextInt(4) == 0 ? TestUtil.nextInt(r, 100, 500) : r.nextInt(20) + 1;
+          final int threshold = randomThreshold(r, size);
+          final boolean runCap = r.nextBoolean();
+          FieldDoc after = null;
+          if (r.nextInt(5) == 0) {
+            final TopFieldDocs first =
+                search(reader, query, new Sort(stockField), 50, null, 1000, null);
+            if (first.scoreDocs.length > 0) {
+              final FieldDoc hit = (FieldDoc) first.scoreDocs[r.nextInt(first.scoreDocs.length)];
+              after = new FieldDoc(hit.doc, Float.NaN, hit.fields);
+            }
+          }
+          CollectExperiments.setCompetitiveRunCap(runCap);
+          final TopFieldDocs stock =
+              search(reader, query, new Sort(stockField), size, after, threshold, null);
+          final Recorder recorder = new Recorder();
+          NumericComparator.testHooks = recorder;
+          final TopFieldDocs variant =
+              search(reader, query, new Sort(variantField), size, after, threshold, null);
+          NumericComparator.testHooks = null;
+          resetSwitches();
+          assertSameTopDocs(stock, variant, threshold);
+          if (multiValued && anyMultiValuedSegment && reader.leaves().size() == 1) {
+            assertFalse(
+                "the clamp is not applied on a multi-valued segment",
+                recorder.clamps.contains(true));
+          }
+        }
+      }
+    }
+  }
+
+  private static SortField copy(SortField field) {
+    final SortField copy;
+    if (field instanceof SortedNumericSortField sn) {
+      copy =
+          new SortedNumericSortField(
+              sn.getField(), sn.getNumericType(), sn.getReverse(), sn.getSelector());
+    } else {
+      copy = new SortField(field.getField(), field.getType(), field.getReverse());
+    }
+    if (field.getMissingValue() != null) {
+      copy.setMissingValue(field.getMissingValue());
+    }
+    assertEquals(field, copy);
+    return copy;
+  }
+
   static final class Run {
     TopFieldDocs top;
     Delivered delivered;
@@ -632,6 +780,13 @@ public class TestComparatorExperiments extends LuceneTestCase {
     @Override
     public void onInstall(DocIdSetIterator iterator) {
       installs.add(iterator);
+    }
+
+    final List<Boolean> clamps = new ArrayList<>();
+
+    @Override
+    public void onClamp(boolean applied) {
+      clamps.add(applied);
     }
   }
 

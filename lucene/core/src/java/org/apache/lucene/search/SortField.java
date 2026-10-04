@@ -30,6 +30,7 @@ import org.apache.lucene.search.comparators.DoubleComparator;
 import org.apache.lucene.search.comparators.FloatComparator;
 import org.apache.lucene.search.comparators.IntComparator;
 import org.apache.lucene.search.comparators.LongComparator;
+import org.apache.lucene.search.comparators.NumericComparator;
 import org.apache.lucene.search.comparators.TermOrdValComparator;
 import org.apache.lucene.store.DataInput;
 import org.apache.lucene.store.DataOutput;
@@ -132,6 +133,11 @@ public class SortField {
 
   // Used for 'sortMissingFirst/Last'
   protected Object missingValue = null;
+
+  // K1: the range every matching doc's sort value lies in (not part of equals/hashCode)
+  private boolean competitiveBoundsSet;
+  private long competitiveMin = Long.MIN_VALUE;
+  private long competitiveMax = Long.MAX_VALUE;
 
   // Indicates if sort should be optimized with indexed data. Set to true by default.
   @Deprecated private boolean optimizeSortWithIndexedData = true;
@@ -503,6 +509,36 @@ public class SortField {
   }
 
   /**
+   * Tells the comparator that the sort value of every doc the query matches lies in {@code [min,
+   * max]}, for example because the query requires a range on the sort field. On a segment where
+   * every doc has exactly one value, the comparator then limits its competitive range to these
+   * bounds. Only for {@link Type#LONG} sorts. Not part of {@link #equals} or {@link #hashCode}.
+   *
+   * @lucene.experimental
+   */
+  public void setCompetitiveBounds(long min, long max) {
+    if (competitiveBoundsType() != Type.LONG) {
+      throw new IllegalArgumentException(
+          "competitive bounds need a LONG sort, got " + competitiveBoundsType());
+    }
+    competitiveBoundsSet = true;
+    competitiveMin = min;
+    competitiveMax = max;
+  }
+
+  /** The numeric type that {@link #setCompetitiveBounds} checks. */
+  Type competitiveBoundsType() {
+    return type;
+  }
+
+  /** Passes the bounds of {@link #setCompetitiveBounds} to a numeric comparator, if set. */
+  final void applyCompetitiveBounds(FieldComparator<?> comparator) {
+    if (competitiveBoundsSet && comparator instanceof NumericComparator<?> numeric) {
+      numeric.setCompetitiveBounds(competitiveMin, competitiveMax);
+    }
+  }
+
+  /**
    * Returns the {@link FieldComparator} to use for sorting.
    *
    * @lucene.experimental
@@ -534,6 +570,7 @@ public class SortField {
 
       case LONG:
         fieldComparator = new LongComparator(numHits, field, (Long) missingValue, reverse, pruning);
+        applyCompetitiveBounds(fieldComparator);
         break;
 
       case DOUBLE:

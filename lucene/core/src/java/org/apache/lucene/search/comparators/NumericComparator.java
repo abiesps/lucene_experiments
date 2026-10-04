@@ -89,6 +89,25 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
     pruning = Pruning.NONE;
   }
 
+  // K1: the range every matching doc's value lies in (SortField#setCompetitiveBounds)
+  private boolean competitiveBoundsSet;
+  private long competitiveMin = Long.MIN_VALUE;
+  private long competitiveMax = Long.MAX_VALUE;
+
+  /**
+   * Tells the comparator that the sort value of every doc the query matches lies in {@code [min,
+   * max]} (as comparable longs). On a segment where every doc with a value has exactly one point,
+   * the points-based competitive iterator is then limited to these bounds. The competitive iterator
+   * is intersected with the query, so this cannot change the results.
+   *
+   * @lucene.experimental
+   */
+  public void setCompetitiveBounds(long min, long max) {
+    competitiveBoundsSet = true;
+    competitiveMin = min;
+    competitiveMax = max;
+  }
+
   protected abstract long missingValueAsComparableLong();
 
   /**
@@ -520,6 +539,9 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
 
     /** A builder installed {@code iterator} as the inner competitive iterator. */
     default void onInstall(DocIdSetIterator iterator) {}
+
+    /** K1: the points builder clamped ({@code true}) or ignored the competitive bounds. */
+    default void onClamp(boolean applied) {}
   }
 
   /** Read by every builder at leaf start; null in production. */
@@ -589,6 +611,20 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
 
     @Override
     protected void doUpdateCompetitiveIterator() throws IOException {
+      // K1: on a segment where every doc with a value has one point, a matching doc's sort value
+      // lies in the query's range on the sort field, so the competitive range can be clamped to it
+      final long minValue, maxValue;
+      final boolean clamp = competitiveBoundsSet && pointValues.size() == pointValues.getDocCount();
+      if (clamp) {
+        minValue = Math.max(minValueAsLong, competitiveMin);
+        maxValue = Math.min(maxValueAsLong, competitiveMax);
+      } else {
+        minValue = minValueAsLong;
+        maxValue = maxValueAsLong;
+      }
+      if (hooks != null && competitiveBoundsSet) {
+        hooks.onClamp(clamp);
+      }
       DocIdSetBuilder result = new DocIdSetBuilder(maxDoc);
       PointValues.IntersectVisitor visitor =
           new PointValues.IntersectVisitor() {
@@ -613,7 +649,7 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
                 return; // already visited or skipped
               }
               long l = sortableBytesToLong(packedValue);
-              if (l >= minValueAsLong && l <= maxValueAsLong) {
+              if (l >= minValue && l <= maxValue) {
                 adder.add(docID); // doc is competitive
               }
             }
@@ -636,7 +672,7 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
               long min = sortableBytesToLong(minPackedValue);
               long max = sortableBytesToLong(maxPackedValue);
 
-              if (min > maxValueAsLong || max < minValueAsLong) {
+              if (min > maxValue || max < minValue) {
                 // 1. cmp ==0 and pruning==Pruning.GREATER_THAN_OR_EQUAL_TO : if the sort is
                 // ascending then maxValueAsLong is bottom's next less value, so it is competitive
                 // 2. cmp ==0 and pruning==Pruning.GREATER_THAN: maxValueAsLong equals to
@@ -644,7 +680,7 @@ public abstract class NumericComparator<T extends Number> extends FieldComparato
                 return PointValues.Relation.CELL_OUTSIDE_QUERY;
               }
 
-              if (min < minValueAsLong || max > maxValueAsLong) {
+              if (min < minValue || max > maxValue) {
                 return PointValues.Relation.CELL_CROSSES_QUERY;
               }
               return PointValues.Relation.CELL_INSIDE_QUERY;
